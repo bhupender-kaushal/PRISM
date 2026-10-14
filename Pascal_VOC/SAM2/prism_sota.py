@@ -91,7 +91,7 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
             indices = np.random.choice(len(rows), num_noise, replace=False)
             for c in range(C): perturbed_image[rows[indices], cols[indices], c] = np.random.choice([0.0, 1.0], num_noise)
     elif noise_type == 'poisson':
-        scale = max(0.05, 3.2 * noise_level) * 300.0
+        scale = max(0.05, 3.2 - noise_level) * 300.0
         for c in range(C): perturbed_image[region_mask, c] = np.random.poisson(np.clip(perturbed_image[region_mask, c], 0, 1) * scale) / scale
     elif noise_type == 'speckle':
         for c in range(C): perturbed_image[region_mask, c] *= (1.0 + np.random.normal(0, 0.1 * noise_level, size=(H, W))[region_mask])

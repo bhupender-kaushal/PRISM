@@ -89,7 +89,7 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
             indices = np.random.choice(len(rows), num_noise, replace=False)
             for c in range(C): perturbed_image[rows[indices], cols[indices], c] = np.random.choice([0.0, 1.0], num_noise)
     elif noise_type == 'poisson':
-        scale = max(0.05, 3.2 * noise_level) * 300.0
+        scale = max(0.05, 3.2 - noise_level) * 300.0
         for c in range(C): perturbed_image[region_mask, c] = np.random.poisson(np.clip(perturbed_image[region_mask, c], 0, 1) * scale) / scale
     elif noise_type == 'speckle':
         for c in range(C): perturbed_image[region_mask, c] *= (1.0 + np.random.normal(0, 0.1 * noise_level, size=(H, W))[region_mask])
@@ -133,7 +133,10 @@ class GenericSegmentationDataset(Dataset):
         self.mask_dir = os.path.join(root_dir, 'masks')
         self.image_filenames = sorted(os.listdir(self.image_dir))
         self.transform = transforms.Compose([transforms.Resize(image_size), transforms.ToTensor()])
-        self.mask_transform = transforms.Compose([transforms.Resize(image_size, interpolation=transforms.InterpolationMode.NEAREST), transforms.ToTensor()])
+        self.mask_transform = transforms.Compose([
+            transforms.Resize(image_size, interpolation=Image.NEAREST), 
+            transforms.ToTensor()
+        ])
     
     def __len__(self): return len(self.image_filenames)
     
@@ -179,7 +182,7 @@ class SAM1ModelWrapper(BaseModelWrapper):
         points_np = batch['prompt_points'].squeeze(0).cpu().numpy()
         labels_np = batch['prompt_labels'].squeeze(0).cpu().numpy()
 
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+        with torch.no_grad(), torch.cuda.amp.autocast():
             self.model.set_image(image_np_rgb)
             masks, _, logits = self.model.predict(point_coords=points_np, point_labels=labels_np, multimask_output=True)
             
