@@ -86,8 +86,9 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
         rows, cols = np.where(region_mask)
         num_noise = int(density * len(rows))
         if num_noise > 0:
-            indices = np.random.choice(len(rows), num_noise, replace=False)
-            for c in range(C): perturbed_image[rows[indices], cols[indices], c] = np.random.choice([0.0, 1.0], num_noise)
+            for c in range(C):
+                indices = np.random.choice(len(rows), num_noise, replace=False)
+                perturbed_image[rows[indices], cols[indices], c] = np.random.choice([0.0, 1.0], num_noise)
     elif noise_type == 'poisson':
         scale = max(0.05, 3.2 - noise_level) * 300.0
         for c in range(C): perturbed_image[region_mask, c] = np.random.poisson(np.clip(perturbed_image[region_mask, c], 0, 1) * scale) / scale
@@ -146,16 +147,42 @@ class GenericSegmentationDataset(Dataset):
         mask = Image.open(os.path.join(self.mask_dir, img_name.replace('.jpg', '.png'))).convert('L')
         mask_resized = self.mask_transform(mask).squeeze().numpy()
 
-        prompt_data = {'points': [[0, 0]], 'labels': [1]} 
+        prompt_data = {'points': [[0, 0]], 'labels': [1]}
         labeled_mask, num_features = label(mask_resized)
         if num_features > 0:
             sizes = [(labeled_mask == i).sum() for i in range(1, num_features + 1)]
             cc_mask = (labeled_mask == (np.argmax(sizes) + 1))
-            min_y, min_x = np.argwhere(cc_mask).min(axis=0)
-            cy, cx = center_of_mass(cc_mask)
-            
-            cy = int(np.clip(cy, 0, mask_resized.shape[0] - 1))
-            cx = int(np.clip(cx, 0, mask_resized.shape[1] - 1))
+
+            coords = np.argwhere(cc_mask)
+            min_y, min_x = coords.min(axis=0)
+            max_y, max_x = coords.max(axis=0)
+
+            cropped_cc_mask = cc_mask[min_y:max_y+1, min_x:max_x+1]
+            dist_transform = distance_transform_edt(cropped_cc_mask)
+
+            h, w = dist_transform.shape
+            y, x = np.ogrid[:h, :w]
+
+            local_com_y, local_com_x = center_of_mass(cropped_cc_mask)
+            sigma_y, sigma_x = max(h / 3.0, 1e-5), max(w / 3.0, 1e-5)
+            spatial_weight = np.exp(-(((y - local_com_y)**2) / (2 * sigma_y**2) + ((x - local_com_x)**2) / (2 * sigma_x**2)))
+
+            H_img, W_img = mask_resized.shape
+            margin_y, margin_x = 0.20 * H_img, 0.20 * W_img
+
+            Y_global = min_y + y
+            X_global = min_x + x
+
+            dist_y = np.maximum(0, np.maximum(margin_y - Y_global, Y_global - (H_img - margin_y)))
+            dist_x = np.maximum(0, np.maximum(margin_x - X_global, X_global - (W_img - margin_x)))
+
+            global_penalty = np.exp(-(dist_y**2 / (2 * (margin_y / 2.0)**2) + dist_x**2 / (2 * (margin_x / 2.0)**2)))
+
+            weighted_edt = dist_transform * spatial_weight * global_penalty
+            local_cy, local_cx = np.unravel_index(np.argmax(weighted_edt), weighted_edt.shape)
+
+            cy = int(np.clip(min_y + local_cy, 0, mask_resized.shape[0] - 1))
+            cx = int(np.clip(min_x + local_cx, 0, mask_resized.shape[1] - 1))
             prompt_data = {'points': [[cx, cy]], 'labels': [1]}
             
         return {

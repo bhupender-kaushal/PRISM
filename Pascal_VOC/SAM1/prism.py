@@ -40,6 +40,11 @@ except ImportError:
     print("and that its location is accessible to your Python environment.")
     sys.exit()
 
+random_seed = 42
+random.seed(random_seed)
+torch.random.manual_seed(random_seed)
+np.random.seed(random_seed)
+
 # --------------------------------------------------------------------------
 # --- 1. Scoring and Helper Functions
 # --------------------------------------------------------------------------
@@ -237,8 +242,7 @@ class BaseModelWrapper(ABC):
 class SAM1ModelWrapper(BaseModelWrapper):
     def predict(self, batch: dict):
         image_tensor = batch['image_tensor'].squeeze(0)
-        image_np_rgb = (image_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        H, W = image_np_rgb.shape[:2]
+        image_np_rgb = np.ascontiguousarray((image_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
         
         points, labels = batch['prompt_points'], batch['prompt_labels']
         points_np = points.squeeze(0).cpu().numpy()
@@ -258,14 +262,14 @@ class SAM1ModelWrapper(BaseModelWrapper):
                 multimask_output=True,
             )
 
-            # Interpolate raw logits to match high-resolution image size
+            # Upscale low-res logits with SAM's own postprocessing (removes the square padding)
             logits_tensor = torch.tensor(logits, dtype=torch.float32)
-            if logits_tensor.dim() == 3: 
+            if logits_tensor.dim() == 3:
                 logits_tensor = logits_tensor.unsqueeze(0)
-                
-            logits_high_res = torch.nn.functional.interpolate(
-                logits_tensor, size=(H, W), mode="bilinear", align_corners=False
-            )
+
+            logits_high_res = self.model.model.postprocess_masks(
+                logits_tensor.to(self.model.device), self.model.input_size, self.model.original_size
+            ).float()
             probs = torch.sigmoid(logits_high_res).squeeze(0).cpu().numpy()
             
         return masks.astype(np.uint8), probs
@@ -502,15 +506,15 @@ def run_ranking_analysis(
 # --- 4. Main Inference Pipeline
 # --------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="PRISM Original Continuous Noise Engine (Upgraded Probability Rank) - SAMv1")
-    parser.add_argument('--data_dir', type=str, required=False, default='/bhupender/2025/Mouse_other/dataset/pascal_sam_dataset_final')
+    parser = argparse.ArgumentParser(description="PRISM IC/OC Continuous Noise Engine - SAM1")
+    parser.add_argument('--data_dir', type=str, required=False, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/dataset/pascal_sam_dataset_final')
     parser.add_argument('--model_name', type=str, default='sam_vit_h')
     parser.add_argument('--model_type', type=str, default='vit_h')
-    parser.add_argument('--model_path', type=str, required=False, default='./sam_vit_h_4b8939.pth')
-    parser.add_argument('--output_dir', type=str, default='./prism_out_original')
-    parser.add_argument('--txtfile', type=str, default='/bhupender/2025/Mouse_other/img_sel.txt', help="Path to frozen image cohort text file.")    
+    parser.add_argument('--model_path', type=str, required=False, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/SAM1/sam_vit_h_4b8939.pth')
+    parser.add_argument('--output_dir', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/results/sam1/prism_out_icoc')
+    parser.add_argument('--txtfile', type=str, default='./img_sel.txt', help="Path to frozen image cohort text file.")    
     parser.add_argument('--num_images', type=int, default=50, help="Target qualified images.")
-    parser.add_argument('--num_dataset_runs', type=int, default=10, help="Dataset iterations.")
+    parser.add_argument('--num_dataset_runs', type=int, default=1, help="Dataset iterations.")
     parser.add_argument('--noise_step', type=float, default=0.05, help="Step size for noise perturbation loop.")
     parser.add_argument('--image_size', type=int, nargs=2, default=[512, 1024])
     parser.add_argument('--target_class', type=str, default='person')
@@ -563,7 +567,7 @@ def main():
         pred_mask = all_pred_masks[best_channel_index]
         initial_probs = all_probs[best_channel_index]
 
-        segments_slic = slic(orig_image_01, n_segments=500, compactness=10, sigma=1, channel_axis=-1)
+        segments_slic = slic(orig_image_01, n_segments=100, compactness=10, sigma=1, channel_axis=-1)
 
         # Absolute Anchoring (No prediction threshold filters used)
         ic_sps_all, oc_sps_all = get_strict_ic_oc_superpixels(segments_slic, gt_mask, ic_threshold=1.0, oc_threshold=0.00)
@@ -609,20 +613,7 @@ def main():
                 }
             }
 
-            # Extract ALL unique superpixels for the pure SOTA baseline
-            all_sps = np.unique(segments_slic)
-            all_sps = all_sps[all_sps != 0]
-
-            # --- 1. Global SOTA Analysis ---
-            res_global = run_ranking_analysis(
-                'global_sota', model_wrapper, batch, orig_image_01, gt_mask, segments_slic, 
-                all_sps, all_sps, noise_types, noise_char_map, 
-                current_image_output_dir, pred_mask, initial_probs, best_channel_index, 
-                ic_sps_all, oc_sps_all, noise_step=args.noise_step, save_visuals=(run_idx == 0)
-            )
-            final_analysis['global_sota_analysis'] = res_global
-
-            # --- 2. In-Context Analysis ---
+            # --- 1. In-Context Analysis ---
             res_ic = run_ranking_analysis(
                 'in_context', model_wrapper, batch, orig_image_01, gt_mask, segments_slic, 
                 ic_sps_all, ic_sps_all, noise_types, noise_char_map, 
@@ -631,7 +622,7 @@ def main():
             )
             final_analysis['in_context_analysis'] = res_ic
 
-            # --- 3. Out-of-Context Analysis ---
+            # --- 2. Out-of-Context Analysis ---
             num_oc_to_perturb = int(0.70 * len(oc_sps_all))
             out_of_context_sp_to_perturb = random.sample(oc_sps_all, num_oc_to_perturb)
 
