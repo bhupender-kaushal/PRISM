@@ -158,6 +158,17 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
 
     return np.clip(perturbed_image, 0.0, 1.0), noise_char_value
 
+def save_downsampled_image(arr, path, is_mask=False, size=(256, 256)):
+    """Saves a numpy array as an image, forced to 256x256 resolution to save disk space."""
+    if is_mask:
+        img = Image.fromarray((arr * 255).astype(np.uint8), mode='L')
+    else:
+        img = Image.fromarray(np.clip(arr * 255, 0, 255).astype(np.uint8), mode='RGB')
+
+    # Use Nearest Neighbor for binary masks, Bilinear for RGB images
+    img = img.resize(size, Image.NEAREST if is_mask else Image.BILINEAR)
+    img.save(path)
+
 # --------------------------------------------------------------------------
 # --- 2.Dataset and Model Wrappers
 # --------------------------------------------------------------------------
@@ -407,13 +418,11 @@ def run_ranking_analysis(
             perturbed_probs = all_perturbed_probs[best_channel_index]
 
             if save_visuals and int(round(noise_level, 2) * 100) % 50 == 0:
-                perturbed_image_to_save = (perturbed_image_01 * 255).astype(np.uint8)
-                Image.fromarray(perturbed_image_to_save).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}.png"))
-                mask_to_save = (perturbed_pred_mask * 255).astype(np.uint8)
-                Image.fromarray(mask_to_save).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_mask.png"))
+                save_prefix = os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}")
+                save_downsampled_image(perturbed_image_01, f"{save_prefix}.png")
+                save_downsampled_image(perturbed_pred_mask, f"{save_prefix}_mask.png", is_mask=True)
                 overlay_image = mark_boundaries(perturbed_image_01, perturbed_pred_mask, color=(1, 0, 0), mode='thick')
-                overlay_to_save = (overlay_image * 255).astype(np.uint8)
-                Image.fromarray(overlay_to_save).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_overlay.png"))
+                save_downsampled_image(overlay_image, f"{save_prefix}_overlay.png")
 
             # --- Global IoU at Step k ---
             intersect_k = np.sum((perturbed_pred_mask == 1) & (gt_mask > 0))
