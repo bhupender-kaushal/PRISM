@@ -398,7 +398,7 @@ def main():
     parser.add_argument('--model_name', type=str, default='sam2_hiera_large')
     parser.add_argument('--model_path', type=str, required=False, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/SAM2/SAMv2/sam2/checkpoints/sam2.1_hiera_large.pt')
     parser.add_argument('--model_config', type=str, required=False, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/SAM2/SAMv2/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml')
-    parser.add_argument('--output_dir', type=str, default='./prism_out_insertion_deletion')
+    parser.add_argument('--output_dir', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/results/sam2/prism_out_insertion_deletion')
     parser.add_argument('--txtfile', type=str, default='./img_sel.txt')
     parser.add_argument('--num_images', type=int, default=50)
     parser.add_argument('--image_size', type=int, nargs=2, default=[512, 1024])
