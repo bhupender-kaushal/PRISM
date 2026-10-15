@@ -121,6 +121,20 @@ def id_auc(traj, frac, saved_auc):
 # ==========================================
 # 3. DATA PARSER
 # ==========================================
+def frac_label(frac):
+    return f"{int(round(frac * 100))}%"
+
+def labelled(items, fmt=str):
+    """Pair each configured rater with a unique label; repeated entries become separate raters (#1, #2, ...)."""
+    base = [fmt(item) for item in items]
+    counts, seen, out = Counter(base), Counter(), []
+    for item, label in zip(items, base):
+        if counts[label] > 1:
+            seen[label] += 1
+            label = f"{label}#{seen[label]}"
+        out.append((item, label))
+    return out
+
 def load_jsons(root, pattern, skipped, tag):
     root = Path(root)
     if not root.exists():
@@ -137,10 +151,12 @@ def load_jsons(root, pattern, skipped, tag):
 
 def extract_all_scores():
     records, skipped = [], Counter()
-    def add(model, image_id, paradigm, perturbation, frac, score):
+    noises, baselines = labelled(NOISES), labelled(ID_BASELINES)
+    levels = labelled(LEVEL_FRACTIONS, frac_label)
+    def add(model, image_id, paradigm, perturbation, level, score):
         if score is not None and not np.isnan(score):
             records.append({'model': model, 'image_id': image_id, 'paradigm': paradigm,
-                            'perturbation': perturbation, 'level_frac': frac, 'score': score})
+                            'perturbation': perturbation, 'level': level, 'score': score})
 
     # --- IC/OC S-FACTOR ---
     if PARADIGMS['S-Factor (IC/OC)']:
@@ -152,14 +168,14 @@ def extract_all_scores():
                 except KeyError as e:
                     skipped[f"{model} IC/OC: missing key {e}"] += 1
                     continue
-                for noise in NOISES:
+                for noise, noise_lbl in noises:
                     if noise not in ic or noise not in oc:
                         skipped[f"{model} IC/OC: missing noise '{noise}'"] += 1
                         continue
                     ic_lvls, oc_lvls = ic[noise]['level_data'], oc[noise]['level_data']
                     n = min(len(ic_lvls), len(oc_lvls))
-                    for frac in LEVEL_FRACTIONS:
-                        add(model, image_id, 'S-Factor (IC/OC)', noise, frac,
+                    for frac, lvl_lbl in levels:
+                        add(model, image_id, 'S-Factor (IC/OC)', noise_lbl, lvl_lbl,
                             calculate_holistic_s_factor(truncate_levels(ic_lvls[:n], frac), truncate_levels(oc_lvls[:n], frac)))
 
     # --- GLOBAL CONTINUOUS AUC ---
@@ -171,12 +187,12 @@ def extract_all_scores():
                 except KeyError as e:
                     skipped[f"{model} Global: missing key {e}"] += 1
                     continue
-                for noise in NOISES:
+                for noise, noise_lbl in noises:
                     if noise not in gl:
                         skipped[f"{model} Global: missing noise '{noise}'"] += 1
                         continue
-                    for frac in LEVEL_FRACTIONS:
-                        add(model, image_id, 'Global Continuous AUC', noise, frac, global_auc(gl[noise]['level_data'], frac))
+                    for frac, lvl_lbl in levels:
+                        add(model, image_id, 'Global Continuous AUC', noise_lbl, lvl_lbl, global_auc(gl[noise]['level_data'], frac))
 
     # --- STANDARD I/D AUC ---
     want_del, want_ins = PARADIGMS['Standard I/D AUC (Deletion)'], PARADIGMS['Standard I/D AUC (Insertion)']
@@ -188,16 +204,16 @@ def extract_all_scores():
                 except KeyError as e:
                     skipped[f"{model} I/D: missing key {e}"] += 1
                     continue
-                for baseline in ID_BASELINES:
+                for baseline, base_lbl in baselines:
                     traj = trajectories.get(baseline, {}).get('prob_ranked')
                     if traj is None:
                         skipped[f"{model} I/D: missing baseline '{baseline}'"] += 1
                         continue
-                    for frac in LEVEL_FRACTIONS:
+                    for frac, lvl_lbl in levels:
                         if want_del:
-                            add(model, image_id, 'Standard I/D AUC (Deletion)', baseline, frac, id_auc(traj['deletion'], frac, traj.get('auc_del')))
+                            add(model, image_id, 'Standard I/D AUC (Deletion)', base_lbl, lvl_lbl, id_auc(traj['deletion'], frac, traj.get('auc_del')))
                         if want_ins:
-                            add(model, image_id, 'Standard I/D AUC (Insertion)', baseline, frac, id_auc(traj['insertion'], frac, traj.get('auc_ins')))
+                            add(model, image_id, 'Standard I/D AUC (Insertion)', base_lbl, lvl_lbl, id_auc(traj['insertion'], frac, traj.get('auc_ins')))
 
     if skipped:
         print("\n>>> SKIPPED DURING EXTRACTION")
@@ -223,21 +239,18 @@ def compute_mean_spearman(df_pivot):
     idx = np.triu_indices_from(corr_matrix, k=1)
     return np.nanmean(corr_matrix[idx])
 
-def frac_label(frac):
-    return f"{int(round(frac * 100))}%"
-
 def rater_groups(p_df):
     """Yield (scheme, group, rater-labelled frame) for every enabled rater scheme."""
     if 'perturbation' in RATER_SCHEMES:
-        for frac in LEVEL_FRACTIONS:
-            sub = p_df[p_df['level_frac'] == frac]
-            yield 'perturbation', f"levels {frac_label(frac)}", sub.assign(rater=sub['perturbation'])
+        for _, lvl_lbl in labelled(LEVEL_FRACTIONS, frac_label):
+            sub = p_df[p_df['level'] == lvl_lbl]
+            yield 'perturbation', f"levels {lvl_lbl}", sub.assign(rater=sub['perturbation'])
     if 'perturbation_x_level' in RATER_SCHEMES:
-        yield 'perturbation_x_level', 'all', p_df.assign(rater=p_df['perturbation'] + '@' + p_df['level_frac'].map(frac_label))
+        yield 'perturbation_x_level', 'all', p_df.assign(rater=p_df['perturbation'] + '@' + p_df['level'])
     if 'level_within_perturbation' in RATER_SCHEMES:
         for pert in p_df['perturbation'].unique():
             sub = p_df[p_df['perturbation'] == pert]
-            yield 'level_within_perturbation', pert, sub.assign(rater=sub['level_frac'].map(frac_label))
+            yield 'level_within_perturbation', pert, sub.assign(rater=sub['level'])
 
 def run_image_ranking_consistency(df_all):
     results = []
