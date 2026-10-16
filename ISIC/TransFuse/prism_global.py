@@ -497,7 +497,7 @@ def main():
     parser.add_argument('--num_images', type=int, default=50, help="Target number of qualified images to find.")
     parser.add_argument('--num_dataset_runs', type=int, default=1, help="Number of dataset iterations for variance calculation.")
     parser.add_argument('--noise_step', type=float, default=0.05, help="Step size for noise loop.")
-    parser.add_argument('--superpixel_size', type=int, default=500)
+    parser.add_argument('--superpixel_size', type=int, default=150)
     parser.add_argument('--noise_types', nargs='+', default=['gaussian', 'salt_pepper', 'poisson', 'speckle', 'gaussian_blur', 'rician'])
     parser.add_argument('--perturb_ratio', type=float, default=1.0)
     

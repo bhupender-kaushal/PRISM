@@ -132,6 +132,18 @@ def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_lev
 
     return np.clip(perturbed_image, 0.0, 1.0)
 
+# --- Image Downsampling and Saving Helper (same as Pascal VOC) ---
+def save_downsampled_image(arr, path, is_mask=False, size=(256, 256)):
+    """Saves a numpy array as an image, forced to 256x256 resolution to save disk space."""
+    if is_mask:
+        img = Image.fromarray((np.asarray(arr) * 255).astype(np.uint8), mode='L')
+    else:
+        img = Image.fromarray(np.clip(arr * 255, 0, 255).astype(np.uint8), mode='RGB' if arr.ndim == 3 else 'L')
+    
+    # Use Nearest Neighbor for binary masks, Bilinear for images
+    img = img.resize(size, Image.NEAREST if is_mask else Image.BILINEAR)
+    img.save(path)
+
 def generate_baseline_canvas(orig_image_01, baseline_type):
     """Generates the Null-Information canvas (Black, Mean, or Max-Noise) for I/D."""
     if baseline_type == 'black':
@@ -232,7 +244,7 @@ def visualize_segmentation_comparison(orig_image_01, gt_mask, pred_mask, all_sp_
 def run_dual_trajectory_analysis(
     domain_name, model_diffusion, device, val_data, orig_image_01, target_class_gt, segments_slic,
     sps_to_perturb, sps_to_measure, initial_pred_mask_bool, initial_probs,
-    ic_sps_all, oc_sps_all, baselines
+    ic_sps_all, oc_sps_all, baselines, save_dir
 ):
     """Executes Insertion/Deletion ranked by probability, one superpixel per step, saving step-wise superpixel metrics on GT."""
     analysis_results = {
@@ -243,6 +255,12 @@ def run_dual_trajectory_analysis(
     if len(sps_to_perturb) == 0 or len(sps_to_measure) == 0: return analysis_results
     
     max_id = int(np.max(segments_slic)) + 1
+
+    # --- Save Initial States and SP Map (same as Pascal VOC) ---
+    vis_dir_root = os.path.join(save_dir, "visuals")
+    os.makedirs(vis_dir_root, exist_ok=True)
+    save_downsampled_image(mark_boundaries(orig_image_01, segments_slic), os.path.join(vis_dir_root, "superpixel_map.jpg"))
+    save_downsampled_image(orig_image_01, os.path.join(vis_dir_root, "initial_deletion_start.jpg"))
     sp_areas = {int(sp_id): int(np.sum(segments_slic == sp_id)) for sp_id in np.unique(segments_slic)}
     
     # 1. Map Areas, Domains, Probabilities, and EigenCAM Intensities
@@ -337,6 +355,7 @@ def run_dual_trajectory_analysis(
     for baseline in baselines:
         analysis_results["trajectories"][baseline] = {}
         bg_canvas = generate_baseline_canvas(orig_image_01, baseline)
+        save_downsampled_image(bg_canvas, os.path.join(vis_dir_root, f"initial_insertion_start_{baseline}.jpg"))
         
         # Base Deletion Metrics
         base_intersect = np.sum((initial_pred_mask_bool == 1) & (target_class_gt == 1))
@@ -356,6 +375,9 @@ def run_dual_trajectory_analysis(
             traj = {"deletion": [], "insertion": []}
             traj["deletion"].append(create_entry(0.0, base_global_iou, 0.0, base_f_prob, base_sps))
             traj["insertion"].append(create_entry(0.0, ins_base_iou, 0.0, ins_base_prob, ins_base_sps))
+            
+            baseline_vis_dir = os.path.join(vis_dir_root, baseline, r_name)
+            os.makedirs(baseline_vis_dir, exist_ok=True)
             
             pbar = tqdm(k_values, desc=f"   -> [{domain_name[:2].upper()}] {baseline.upper()} | {r_name}", leave=False)
             for k in pbar:
@@ -381,6 +403,16 @@ def run_dual_trajectory_analysis(
                 prob_f_ins = float(np.mean(prob_ins[pred_ins_bool == 1])) if np.any(pred_ins_bool == 1) else 0.0
                 ins_sps = get_step_superpixels(pred_ins_bool, prob_ins)
                 traj["insertion"].append(create_entry(fraction, iou_ins, spill_ins, prob_f_ins, ins_sps))
+
+                # --- Save the perturbed inputs and predicted masks (same as Pascal VOC) ---
+                step_vis_dir = os.path.join(baseline_vis_dir, f"step_{k:03d}")
+                os.makedirs(step_vis_dir, exist_ok=True)
+                
+                save_downsampled_image(img_del, os.path.join(step_vis_dir, "deletion_input.jpg"))
+                save_downsampled_image(pred_del_bool, os.path.join(step_vis_dir, "deletion_pred.png"), is_mask=True)
+                
+                save_downsampled_image(img_ins, os.path.join(step_vis_dir, "insertion_input.jpg"))
+                save_downsampled_image(pred_ins_bool, os.path.join(step_vis_dir, "insertion_pred.png"), is_mask=True)
 
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -554,7 +586,8 @@ def main():
             initial_probs=initial_probs, 
             ic_sps_all=ic_sps_all, 
             oc_sps_all=oc_sps_all, 
-            baselines=baselines                  # Loop over 6+2 canvases
+            baselines=baselines,                  # Loop over 6+2 canvases
+            save_dir=current_dir         # Per-step 256x256 visuals
         )
 
         with open(os.path.join(current_dir, f"{case_name}_analysis.json"), 'w') as f: 
