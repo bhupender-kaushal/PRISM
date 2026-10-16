@@ -33,6 +33,11 @@ import data as Data
 import model as Model
 import core.logger as Logger
 
+random_seed = 42
+random.seed(random_seed)
+torch.random.manual_seed(random_seed)
+np.random.seed(random_seed)
+
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.integer): return int(obj)
@@ -68,6 +73,17 @@ def get_strict_ic_oc_superpixels(superpixels_segments, gt_mask, ic_threshold=1.0
     return ic_sps, oc_sps
 
 # --- GRAYSCALE SAFE FIX: Noise Application ---
+# Noise strength per unit noise level, tuned for XCAD. The noise forms are shared by all
+# PRISM datasets (RGB: Pascal VOC, ISIC; grayscale: Synapse, XCAD); only these values differ.
+NOISE_PARAMS = {
+    'gaussian_sigma': 0.1,         # std = 0.1 * level
+    'speckle_sigma': 0.1,          # std = 0.1 * level
+    'salt_pepper_density': 0.05,   # density = min(0.5, 0.05 * level)
+    'poisson_photons': 300.0,      # photons = 300 * max(0.05, 3.2 - level)
+    'blur_sigma': 10.0,            # sigma = 10 * level
+    'rician_sigma': 0.1,           # std = 0.1 * level
+}
+
 def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_level):
     """
     Applies mathematically strict 2D perturbations (Grayscale safe). 
@@ -78,13 +94,13 @@ def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_lev
     region_mask = np.isin(segments, sp_to_perturb)
     if not np.any(region_mask):
         return perturbed_image
-
+        
     if noise_type == 'gaussian':
-        noise = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
+        noise = np.random.normal(0, NOISE_PARAMS['gaussian_sigma'] * noise_level, perturbed_image.shape)
         perturbed_image[region_mask] += noise[region_mask]
         
-    elif noise_type == 'salt_pepper' or noise_type == 's&p':
-        noise_char_value = min(0.5, 0.05 * noise_level)
+    elif noise_type == 's&p' or noise_type == 'salt_pepper':
+        noise_char_value = min(0.5, NOISE_PARAMS['salt_pepper_density'] * noise_level)
         num_pixels = np.sum(region_mask)
         num_noise = int(noise_char_value * num_pixels)
         if num_noise > 0:
@@ -93,22 +109,22 @@ def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_lev
             perturbed_image[rows[indices], cols[indices]] = np.random.choice([0.0, 1.0], num_noise)
             
     elif noise_type == 'poisson':
-        sigma = max(0.05, 3.2 - noise_level)
+        photons = NOISE_PARAMS['poisson_photons'] * max(0.05, 3.2 - noise_level)
         region = perturbed_image[region_mask]
-        noisy_region = np.random.poisson(np.clip(region, 0, 1) * 300 * sigma) / (300 * sigma)
+        noisy_region = np.random.poisson(np.clip(region, 0, 1) * photons) / photons
         perturbed_image[region_mask] = noisy_region
         
     elif noise_type == 'speckle':
-        noise = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
+        noise = np.random.normal(0, NOISE_PARAMS['speckle_sigma'] * noise_level, perturbed_image.shape)
         perturbed_image[region_mask] *= (1.0 + noise[region_mask])
         
     elif noise_type == 'gaussian_blur':
-        blurred_image = gaussian_filter(image_01, sigma=10 * noise_level)
+        blurred_image = gaussian_filter(image_01, sigma=NOISE_PARAMS['blur_sigma'] * noise_level)
         perturbed_image[region_mask] = blurred_image[region_mask]
         
     elif noise_type == 'rician':
-        n1 = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
-        n2 = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
+        n1 = np.random.normal(0, NOISE_PARAMS['rician_sigma'] * noise_level, perturbed_image.shape)
+        n2 = np.random.normal(0, NOISE_PARAMS['rician_sigma'] * noise_level, perturbed_image.shape)
         noisy_region = np.sqrt(np.square(perturbed_image + n1) + np.square(n2))
         perturbed_image[region_mask] = noisy_region[region_mask]
 
@@ -433,14 +449,14 @@ def main():
     parser.add_argument('--data_dir', type=str, default=None)
 
     # Core Args
-    parser.add_argument("--output_dir", type=str, default="./prism_out_original")
+    parser.add_argument("--output_dir", type=str, default="/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/XCAD/results/darl/prism_out_icoc")
     parser.add_argument("--num_images", type=int, default=50, help="Target number of qualified images to find.")
-    parser.add_argument("--num_dataset_runs", type=int, default=10, help="Dataset iterations.")
+    parser.add_argument("--num_dataset_runs", type=int, default=1, help="Dataset iterations.")
     parser.add_argument("--noise_step", type=float, default=0.05, help="Step size for noise loop.")
     parser.add_argument("--num_superpixels", type=int, default=500)
     parser.add_argument("--noise_types", nargs='+', default=['gaussian', 'salt_pepper', 'poisson', 'speckle', 'gaussian_blur', 'rician'])
     parser.add_argument('--target_layer_names', nargs='+', default=['Conv'])
-    parser.add_argument('--img_path', type=str, default='/cluster/home/bhupenk/bhupender/bhupender/2025/cdarl_mouse/img_sel.txt', help="Path to frozen images file.")
+    parser.add_argument('--img_path', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/XCAD/img_sel.txt', help="Path to frozen images file.")
 
     args = parser.parse_args()
 
@@ -515,7 +531,7 @@ def main():
         
         segments = slic(orig_image_01, n_segments=args.num_superpixels, compactness=0.1, sigma=1.0, channel_axis=None)
 
-        # Absolute Anchoring (No prediction threshold filters used, 0.85 tolerance based on original)
+        # Absolute Anchoring (No prediction threshold filters used; 0.85 tolerance for thin vessels)
         ic_sps_all, oc_sps_all = get_strict_ic_oc_superpixels(segments, target_class_gt, ic_threshold=0.85, oc_threshold=0.0)
         
         if not ic_sps_all: continue
@@ -532,7 +548,7 @@ def main():
     if len(qualified_images) == 0: sys.exit()
 
     # =========================================================================
-    # PHASE 2: MULTI-RUN ROBUSTNESS INFERENCE (WITH GLOBAL SOTA)
+    # PHASE 2: MULTI-RUN ROBUSTNESS INFERENCE (IC / OC)
     # =========================================================================
     logger.info(f"\n[PHASE 2] Executing Dataset Extractions...")
 
@@ -562,33 +578,8 @@ def main():
                 }
             }
 
-            # Extract ALL unique superpixels for the pure SOTA baseline
-            all_sps = np.unique(segments)
-            all_sps = all_sps[all_sps != 0]
 
-            # --- 1. Global SOTA Analysis ---
-            res_global = run_ranking_analysis(
-                analysis_type='global_sota', 
-                model_diffusion=diffusion, 
-                device=device, 
-                val_data=val_data,
-                orig_image_01=orig_image_01, 
-                segments=segments, 
-                target_class_gt=target_class_gt, 
-                superpixels_to_perturb=all_sps, 
-                superpixels_to_measure=all_sps, 
-                initial_pred_mask_bool=initial_pred_mask_bool,
-                noise_types=args.noise_types, 
-                current_image_output_dir=current_dir, 
-                initial_probs=initial_probs, 
-                ic_sps_all=ic_sps_all, 
-                oc_sps_all=oc_sps_all, 
-                noise_step=args.noise_step, 
-                save_visuals=(run_idx == 0)
-            )
-            final_analysis['global_sota_analysis'] = res_global
-
-            # --- 2. In-Context Analysis ---
+            # --- 1. In-Context Analysis ---
             res_ic = run_ranking_analysis(
                 analysis_type='in_context', 
                 model_diffusion=diffusion, 
@@ -610,7 +601,7 @@ def main():
             )
             final_analysis['in_context_analysis'] = res_ic
 
-            # --- 3. Out-of-Context Analysis ---
+            # --- 2. Out-of-Context Analysis ---
             num_oc_to_perturb = int(0.35 * len(oc_sps_all))
             out_of_context_sp_to_perturb = random.sample(oc_sps_all, num_oc_to_perturb)
             

@@ -34,6 +34,11 @@ from skimage.color import gray2rgb, rgb2gray
 from models.MSDUNet import MSDUFormer_Xnet_3463_FUESMS as model
 from utils.dataloader import test_dataset
 
+random_seed = 42
+random.seed(random_seed)
+torch.random.manual_seed(random_seed)
+np.random.seed(random_seed)
+
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.integer): return int(obj)
@@ -94,13 +99,24 @@ def get_strict_ic_oc_superpixels(superpixels_segments, gt_mask, ic_threshold=1.0
     return ic_sps, oc_sps
 
 # --- RGB CHANNEL-WISE FIX: Noise Application ---
+# Noise strength per unit noise level, tuned for ISIC. The noise forms are shared by all
+# PRISM datasets (RGB: Pascal VOC, ISIC; grayscale: Synapse, XCAD); only these values differ.
+NOISE_PARAMS = {
+    'gaussian_sigma': 0.1,         # std = 0.1 * level
+    'speckle_sigma': 0.1,          # std = 0.1 * level
+    'salt_pepper_density': 0.05,   # density = min(0.5, 0.05 * level)
+    'poisson_photons': 500.0,      # photons = 500 * max(0.05, 3.2 - level)
+    'blur_sigma': 50.0,            # sigma = 50 * level
+    'rician_sigma': 0.1,           # std = 0.1 * level
+}
+
 def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, selected_superpixel_ids, noise_type, noise_level):
     """
     Applies strict channel-wise perturbations over RGB channels for the selected superpixels.
     """
     perturbed_image = np.copy(original_image_scaled)
     noise_char_value = 0.0
-    
+
     region_mask = np.isin(superpixels_segments, selected_superpixel_ids)
     if not np.any(region_mask):
         return perturbed_image, noise_char_value
@@ -108,7 +124,7 @@ def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, 
     H, W, C = perturbed_image.shape
 
     if noise_type == 'gaussian':
-        noise_char_value = 0.1 * noise_level
+        noise_char_value = NOISE_PARAMS['gaussian_sigma'] * noise_level
         for c in range(C):
             channel_data = perturbed_image[:, :, c]
             noise = np.random.normal(0, noise_char_value, size=(H, W))
@@ -116,7 +132,7 @@ def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, 
             perturbed_image[:, :, c] = channel_data
         
     elif noise_type == 'salt_pepper':
-        noise_char_value = min(0.5, 0.05 * noise_level)
+        noise_char_value = min(0.5, NOISE_PARAMS['salt_pepper_density'] * noise_level)
         rows, cols = np.where(region_mask)
         num_pixels = len(rows)
         num_noise = int(noise_char_value * num_pixels)
@@ -128,7 +144,7 @@ def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, 
 
     elif noise_type == 'poisson':
         intensity_scale = max(0.05, 3.2 - noise_level)
-        scale_factor = 500.0 * intensity_scale
+        scale_factor = NOISE_PARAMS['poisson_photons'] * intensity_scale
         noise_char_value = intensity_scale
         for c in range(C):
             channel_data = perturbed_image[:, :, c]
@@ -138,7 +154,7 @@ def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, 
             perturbed_image[:, :, c] = channel_data
         
     elif noise_type == 'speckle':
-        noise_char_value = 0.1 * noise_level
+        noise_char_value = NOISE_PARAMS['speckle_sigma'] * noise_level
         for c in range(C):
             channel_data = perturbed_image[:, :, c]
             noise = np.random.normal(0, noise_char_value, size=(H, W))
@@ -146,13 +162,13 @@ def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, 
             perturbed_image[:, :, c] = channel_data
         
     elif noise_type == 'gaussian_blur':
-        noise_char_value = 50 * noise_level
+        noise_char_value = NOISE_PARAMS['blur_sigma'] * noise_level
         for c in range(C):
             blurred_channel = gaussian_filter(original_image_scaled[:, :, c], sigma=noise_char_value)
             perturbed_image[region_mask, c] = blurred_channel[region_mask]
         
     elif noise_type == 'rician':
-        noise_char_value = 0.1 * noise_level
+        noise_char_value = NOISE_PARAMS['rician_sigma'] * noise_level
         for c in range(C):
             channel_data = perturbed_image[:, :, c]
             region_pixels = channel_data[region_mask]
@@ -450,16 +466,16 @@ def run_ranking_analysis(
 # --- 3. Main Inference Pipeline
 # --------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="PRISM Multi-Run Robustness Extraction Engine (MSDUNet)")
-    parser.add_argument('--pth_path', type=str, default='/bhupender/2025/Mouse_other/Skin_Lesion/MSDUNet/ISIC2016_MSDUNet.pth')
+    parser = argparse.ArgumentParser(description="PRISM IC/OC Continuous Noise Engine - MSDUNet")
+    parser.add_argument('--pth_path', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/ISIC/MSDUNet/ISIC2016_MSDUNet.pth')
     parser.add_argument('--testsize', type=int, default=352)
     parser.add_argument('--num_classes', type=int, default=1)
-    parser.add_argument('--dataroot_val', type=str, default='/bhupender/datasets/Skin_Cancer/segmentation/ISIC2016/test')
+    parser.add_argument('--dataroot_val', type=str, default='/cluster/home/bhupenk/bhupender/datasets/datasets/Skin_Cancer/segmentation/ISIC2016/test')
     parser.add_argument('--target_layer_name', type=str, default='FU_E.conv1')
-    parser.add_argument('--output_dir', type=str, default='./prism_out_original')
-    parser.add_argument('--txtfile', type=str, default='/bhupender/2025/Mouse_other/Skin_Lesion/img_sel.txt', help="Path to the selected images text file containing qualified image names.")
+    parser.add_argument('--output_dir', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/ISIC/results/msdunet/prism_out_icoc')
+    parser.add_argument('--txtfile', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/ISIC/img_sel.txt', help="Path to the selected images text file containing qualified image names.")
     parser.add_argument('--num_images', type=int, default=50, help="Target number of qualified images to find.")
-    parser.add_argument('--num_dataset_runs', type=int, default=10, help="Number of dataset iterations for variance calculation.")
+    parser.add_argument('--num_dataset_runs', type=int, default=1, help="Number of dataset iterations for variance calculation.")
     parser.add_argument('--noise_step', type=float, default=0.05, help="Step size for noise loop.")
     parser.add_argument('--superpixel_size', type=int, default=500)
     parser.add_argument('--noise_types', nargs='+', default=['gaussian', 'salt_pepper', 'poisson', 'speckle', 'gaussian_blur', 'rician'])
@@ -544,7 +560,7 @@ def main():
     if len(qualified_images) == 0: sys.exit()
 
     # =========================================================================
-    # PHASE 2: MULTI-RUN ROBUSTNESS INFERENCE
+    # PHASE 2: MULTI-RUN ROBUSTNESS INFERENCE (IC / OC)
     # =========================================================================
     logger.info(f"\n[PHASE 2] Commencing {args.num_dataset_runs} Dataset Extractions...")
 
@@ -574,19 +590,7 @@ def main():
                 }
             }
 
-            # Extract ALL unique superpixels for the pure SOTA baseline
-            all_sps = np.unique(segments_slic)
-            all_sps = all_sps[all_sps != 0]
-
-            # 1. Global SOTA Analysis
-            res_global = run_ranking_analysis(
-                'global_sota', args, device, model_instance, orig_image_np_01, pred_mask, gt_mask_np, 
-                segments_slic, all_sps, all_sps, args.noise_types, noise_char_map, 
-                current_image_output_dir, initial_probs, ic_sps_all, oc_sps_all, save_visuals=(run_idx == 0)
-            )
-            final_analysis['global_sota_analysis'] = res_global
-
-            # 2. In-Context Analysis 
+            # 1. In-Context Analysis
             res_ic = run_ranking_analysis(
                 'in_context', args, device, model_instance, orig_image_np_01, pred_mask, gt_mask_np, 
                 segments_slic, ic_sps_all, ic_sps_all, args.noise_types, noise_char_map, 
@@ -594,7 +598,7 @@ def main():
             )
             final_analysis['in_context_analysis'] = res_ic
 
-            # 3. Out-of-Context Analysis
+            # 2. Out-of-Context Analysis
             num_oc_to_perturb = int(0.50 * len(oc_sps_all))
             out_of_context_sp_to_perturb = random.sample(oc_sps_all, num_oc_to_perturb)
             

@@ -34,6 +34,11 @@ import data as Data
 import model as Model
 import core.logger as Logger
 
+random_seed = 42
+random.seed(random_seed)
+torch.random.manual_seed(random_seed)
+np.random.seed(random_seed)
+
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.integer): return int(obj)
@@ -69,25 +74,35 @@ def get_strict_ic_oc_superpixels(superpixels_segments, gt_mask, ic_threshold=1.0
         elif gamma <= oc_threshold: oc_sps.append(sp_id)
     return ic_sps, oc_sps
 
-def generate_dynamic_steps(N, max_steps=20):
-    """Guarantees strict monotonic scaling mapping to the exact superpixel count."""
-    if N == 0: return []
-    if N <= max_steps: return list(range(1, N + 1))
-    return sorted(list(set(np.linspace(1, N, max_steps).astype(int))))
+# --- GRAYSCALE SAFE FIX: Noise Application ---
+# Noise strength per unit noise level, tuned for XCAD. The noise forms are shared by all
+# PRISM datasets (RGB: Pascal VOC, ISIC; grayscale: Synapse, XCAD); only these values differ.
+NOISE_PARAMS = {
+    'gaussian_sigma': 0.1,         # std = 0.1 * level
+    'speckle_sigma': 0.1,          # std = 0.1 * level
+    'salt_pepper_density': 0.05,   # density = min(0.5, 0.05 * level)
+    'poisson_photons': 300.0,      # photons = 300 * max(0.05, 3.2 - level)
+    'blur_sigma': 10.0,            # sigma = 10 * level
+    'rician_sigma': 0.1,           # std = 0.1 * level
+}
 
 def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_level):
-    """Applies mathematically strict 2D perturbations (Grayscale safe)."""
+    """
+    Applies mathematically strict 2D perturbations (Grayscale safe). 
+    No channel loops are used.
+    """
     perturbed_image = np.copy(image_01)
     
     region_mask = np.isin(segments, sp_to_perturb)
-    if not np.any(region_mask): return perturbed_image
-
+    if not np.any(region_mask):
+        return perturbed_image
+        
     if noise_type == 'gaussian':
-        noise = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
+        noise = np.random.normal(0, NOISE_PARAMS['gaussian_sigma'] * noise_level, perturbed_image.shape)
         perturbed_image[region_mask] += noise[region_mask]
         
-    elif noise_type == 'salt_pepper' or noise_type == 's&p':
-        noise_char_value = min(0.5, 0.05 * noise_level)
+    elif noise_type == 's&p' or noise_type == 'salt_pepper':
+        noise_char_value = min(0.5, NOISE_PARAMS['salt_pepper_density'] * noise_level)
         num_pixels = np.sum(region_mask)
         num_noise = int(noise_char_value * num_pixels)
         if num_noise > 0:
@@ -96,22 +111,22 @@ def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_lev
             perturbed_image[rows[indices], cols[indices]] = np.random.choice([0.0, 1.0], num_noise)
             
     elif noise_type == 'poisson':
-        sigma = max(0.05, 3.2 - noise_level)
+        photons = NOISE_PARAMS['poisson_photons'] * max(0.05, 3.2 - noise_level)
         region = perturbed_image[region_mask]
-        noisy_region = np.random.poisson(np.clip(region, 0, 1) * 300 * sigma) / (300 * sigma)
+        noisy_region = np.random.poisson(np.clip(region, 0, 1) * photons) / photons
         perturbed_image[region_mask] = noisy_region
         
     elif noise_type == 'speckle':
-        noise = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
+        noise = np.random.normal(0, NOISE_PARAMS['speckle_sigma'] * noise_level, perturbed_image.shape)
         perturbed_image[region_mask] *= (1.0 + noise[region_mask])
         
     elif noise_type == 'gaussian_blur':
-        blurred_image = gaussian_filter(image_01, sigma=10 * noise_level)
+        blurred_image = gaussian_filter(image_01, sigma=NOISE_PARAMS['blur_sigma'] * noise_level)
         perturbed_image[region_mask] = blurred_image[region_mask]
         
     elif noise_type == 'rician':
-        n1 = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
-        n2 = np.random.normal(0, 0.1 * noise_level, perturbed_image.shape)
+        n1 = np.random.normal(0, NOISE_PARAMS['rician_sigma'] * noise_level, perturbed_image.shape)
+        n2 = np.random.normal(0, NOISE_PARAMS['rician_sigma'] * noise_level, perturbed_image.shape)
         noisy_region = np.sqrt(np.square(perturbed_image + n1) + np.square(n2))
         perturbed_image[region_mask] = noisy_region[region_mask]
 
@@ -126,7 +141,7 @@ def generate_baseline_canvas(orig_image_01, baseline_type):
         return np.ones_like(orig_image_01) * mean_color
     else:
         dummy_all_mask = np.ones_like(orig_image_01, dtype=int)
-        return perturb_image_slice(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=3.0)
+        return perturb_image_slice(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=30.0)
 
 def predict_slice_diffusion(model_diffusion, img_01, val_data_template, device):
     """Inference router mapping [0, 1] inputs to [-1, 1] tensors and extracting probabilities."""
@@ -212,14 +227,14 @@ def visualize_segmentation_comparison(orig_image_01, gt_mask, pred_mask, all_sp_
     plt.close(fig)
 
 # --------------------------------------------------------------------------
-# --- 3. Global EigenCAM Causal Trajectory Extraction Engine
+# --- 3. Causal Trajectory Extraction Engine
 # --------------------------------------------------------------------------
 def run_dual_trajectory_analysis(
     domain_name, model_diffusion, device, val_data, orig_image_01, target_class_gt, segments_slic,
-    sps_to_perturb, sps_to_measure, initial_pred_mask_bool, initial_probs, eigencam_heatmap,
+    sps_to_perturb, sps_to_measure, initial_pred_mask_bool, initial_probs,
     ic_sps_all, oc_sps_all, baselines
 ):
-    """Executes Insertion/Deletion ranked by Probability AND EigenCAM, saving step-wise superpixel metrics on GT."""
+    """Executes Insertion/Deletion ranked by probability, one superpixel per step, saving step-wise superpixel metrics on GT."""
     analysis_results = {
         "rank_distribution": [],
         "trajectories": {}
@@ -236,7 +251,6 @@ def run_dual_trajectory_analysis(
         mask = (segments_slic == sp_id)
         area = sp_areas[int(sp_id)]
         mean_p = float(np.mean(initial_probs[mask]))
-        mean_eigen = float(np.mean(eigencam_heatmap[mask]))
         
         if sp_id in ic_sps_all: gt_domain = "IC"
         elif sp_id in oc_sps_all: gt_domain = "OC"
@@ -246,7 +260,6 @@ def run_dual_trajectory_analysis(
             "sp_id": int(sp_id), 
             "area": area, 
             "mean_prob": mean_p, 
-            "mean_eigen": mean_eigen,
             "gt_domain": gt_domain
         })
         
@@ -255,18 +268,13 @@ def run_dual_trajectory_analysis(
     for rank, item in enumerate(rank_data, 1):
         item['prob_rank'] = rank
     prob_ranked_ids = [item['sp_id'] for item in rank_data]
-
-    rank_data.sort(key=lambda x: (x['mean_eigen'], x['area']), reverse=True)
-    for rank, item in enumerate(rank_data, 1):
-        item['eigen_rank'] = rank
-    eigen_ranked_ids = [item['sp_id'] for item in rank_data]
         
     analysis_results["rank_distribution"] = rank_data
-    ranking_methods = {'prob_ranked': prob_ranked_ids, 'eigen_ranked': eigen_ranked_ids}
+    ranking_methods = {'prob_ranked': prob_ranked_ids}
     
     # 3. Dynamic Steps & Helpers
     N_perturb = len(sps_to_perturb)
-    k_values = generate_dynamic_steps(N_perturb, max_steps=20)
+    k_values = list(range(1, N_perturb + 1))  # one superpixel per step
     bg_gt = (target_class_gt == 0)
 
     # Function to get individual GT superpixel tracking at each step
@@ -396,10 +404,10 @@ def main():
     parser.add_argument('--data_dir', type=str, default=None)
 
     # Core Args
-    parser.add_argument("--output_dir", type=str, default="./prism_out_insertion_deletion")
+    parser.add_argument("--output_dir", type=str, default="/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/XCAD/results/darl/prism_out_insertion_deletion")
     parser.add_argument("--num_images", type=int, default=50, help="Target number of qualified images to find.")
     parser.add_argument("--num_superpixels", type=int, default=500)
-    parser.add_argument('--img_path', type=str, default='/cluster/home/bhupenk/bhupender/bhupender/2025/cdarl_mouse/img_sel.txt', help="Path to frozen images file.")
+    parser.add_argument('--img_path', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/XCAD/img_sel.txt', help="Path to frozen images file.")
 
     args = parser.parse_args()
 
@@ -503,7 +511,7 @@ def main():
     # =========================================================================
     # PHASE 2: GLOBAL XAI TRAJECTORY RUN
     # =========================================================================
-    logger.info(f"\n[PHASE 2] Executing Global Dual-Rank I/D Trajectories over 8 Baselines...")
+    logger.info(f"\n[PHASE 2] Executing IC-Restricted Prob-Rank I/D Trajectories over 8 Baselines...")
 
     run_output_dir = args.output_dir
     os.makedirs(run_output_dir, exist_ok=True)
@@ -530,30 +538,27 @@ def main():
         
         visualize_segmentation_comparison(orig_image_01, target_class_gt, initial_pred_mask_bool, segments, in_context_map, out_of_context_map, eigencam_heatmap, save_path=os.path.join(current_dir, case_name + "_overview.png"))
 
-        all_sps = np.unique(segments)
-        all_sps = all_sps[all_sps != 0]
 
         # Unified Global Execution
         res_global = run_dual_trajectory_analysis(
-            domain_name='global_eigen_guided', 
+            domain_name='prob_guided', 
             model_diffusion=diffusion, 
             device=device, 
             val_data=val_data, 
             orig_image_01=orig_image_01, 
             target_class_gt=target_class_gt, 
             segments_slic=segments, 
-            sps_to_perturb=all_sps,              # Perturbing the entire image based on Rank
+            sps_to_perturb=ic_sps_all,           # Perturbing only the GT anatomy (in-context superpixels)
             sps_to_measure=ic_sps_all,           # Strictly tracking the GT anatomy ranks
             initial_pred_mask_bool=initial_pred_mask_bool, 
             initial_probs=initial_probs, 
-            eigencam_heatmap=eigencam_heatmap, 
             ic_sps_all=ic_sps_all, 
             oc_sps_all=oc_sps_all, 
             baselines=baselines                  # Loop over 6+2 canvases
         )
 
         with open(os.path.join(current_dir, f"{case_name}_analysis.json"), 'w') as f: 
-            json.dump({"eigen_guided_analysis": res_global}, f, indent=4, cls=NpEncoder)
+            json.dump({"prob_guided_analysis": res_global}, f, indent=4, cls=NpEncoder)
 
 if __name__ == "__main__":
     main()

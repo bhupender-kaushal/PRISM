@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -224,8 +225,8 @@ class MSDUFormer_Xnet_3463_FUESMS(nn.Module):   #MSDUnet
         dpr = [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
 
         self.backbone = transxnet_xxs()
-        path = '/bhupender/2025/Mouse_other/Skin_Lesion/MSDUNet/ISIC2016_MSDUNet.pth'
-        save_model = torch.load(path)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ISIC2016_MSDUNet.pth')
+        save_model = torch.load(path, map_location='cpu')
         model_dict = self.backbone.state_dict()
         state_dict = {k: v for k, v in save_model.items() if k in model_dict.keys()}
         model_dict.update(state_dict)
