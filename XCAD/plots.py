@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 
-from new_assessments import calculate_holistic_s_factor, trapezoid
+from assessment import calculate_holistic_s_factor, trapezoid
 
 # Set seaborn style for publication-ready plots
 sns.set_theme(style="whitegrid")
@@ -19,30 +19,24 @@ COMMON_X = np.linspace(0.0, 1.0, 101)
 # ==========================================
 # CONFIGURATION & DIRECTORIES
 # ==========================================
-# Result folders per model; replace these to plot runs stored elsewhere.
-RESULTS_ROOT = "/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/results"
+# Result folders per model; edit PRISM_ROOT (or override the dicts below) to plot runs stored elsewhere.
+PRISM_ROOT = "/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM"
 
-PAIRINGS = {
-    "Pascal-VOC": ("SAMv1", "SAMv2"),
-    # "ISIC-2016": ("MSDUNet", "TransFuse"),
-    # "Synapse": ("D-LKA", "TransDeeplab"),
-    # "XCAD": ("CDARL", "DARL"),
+# model -> (dataset folder, results subfolder, dataset name), as written by the PRISM scripts / slurm files
+MODELS = {
+    "DARL": ("XCAD", "darl", "XCAD"),
+    "CDARL": ("XCAD", "cdarl", "XCAD"),
 }
-ICOC_DIRS = {     # prism.py -> run_1/<img>/<img>_analysis.json with in/out_of_context_analysis
-    "SAMv1": f"{RESULTS_ROOT}/sam1/prism_out_icoc",
-    "SAMv2": f"{RESULTS_ROOT}/sam2/prism_out_icoc",
-}
-GLOBAL_DIRS = {   # prism_global.py -> run_1/<img>/<img>_analysis.json with global_sota_analysis
-    "SAMv1": f"{RESULTS_ROOT}/sam1/prism_out_global",
-    "SAMv2": f"{RESULTS_ROOT}/sam2/prism_out_global",
-}
-ID_DIRS = {       # prism_sota.py -> <img>/<img>_analysis.json with prob_guided_analysis
-    "SAMv1": f"{RESULTS_ROOT}/sam1/prism_out_insertion_deletion",
-    "SAMv2": f"{RESULTS_ROOT}/sam2/prism_out_insertion_deletion",
-}
-RUN_SUBDIR = "run_1"
+ICOC_DIRS = {m: f"{PRISM_ROOT}/{ds}/results/{sub}/prism_out_icoc" for m, (ds, sub, _) in MODELS.items()}                  # prism.py
+GLOBAL_DIRS = {m: f"{PRISM_ROOT}/{ds}/results/{sub}/prism_out_global" for m, (ds, sub, _) in MODELS.items()}              # prism_global.py
+ID_DIRS = {m: f"{PRISM_ROOT}/{ds}/results/{sub}/prism_out_insertion_deletion" for m, (ds, sub, _) in MODELS.items()}      # prism_sota.py
+RUN_SUBDIR = "run_1"   # dataset-run folder written by prism.py / prism_global.py
 
-OUT_DIR = f"{RESULTS_ROOT}/plots"
+# One report per dataset, comparing its models
+PAIRINGS = {name: tuple(m for m, (_, _, ds_name) in MODELS.items() if ds_name == name)
+            for name in dict.fromkeys(ds_name for _, _, ds_name in MODELS.values())}
+
+OUT_DIR = f"{PRISM_ROOT}/XCAD/results/plots"
 
 NOISES = ['poisson', 'gaussian', 'speckle', 'salt_pepper', 'gaussian_blur', 'rician']
 ID_BASELINES = ['black', 'mean']
@@ -269,6 +263,9 @@ if __name__ == "__main__":
         for reason, count in sorted(skipped.items()): print(f"  skipped {count:5d} x {reason}")
 
         df = pd.DataFrame(aucs).dropna(subset=['auc'])
+        if df.empty:
+            print(f"  -> No results found for {dataset}; skipping.")
+            continue
         tag = dataset.replace(' ', '_')
         df.to_csv(os.path.join(OUT_DIR, f"{tag}_Per_Image_AUC.csv"), index=False)
         summary = df.groupby(['family', 'condition', 'measure', 'model'])['auc'].agg(['mean', 'std', 'count']).round(4)
@@ -277,6 +274,6 @@ if __name__ == "__main__":
         pdf_path = os.path.join(OUT_DIR, f"{tag}_Report.pdf")
         with PdfPages(pdf_path) as pdf:
             generate_curve_report(dataset, list(models), curves, pdf)
-            if not df.empty: generate_auc_report(dataset, df, pdf)
+            generate_auc_report(dataset, df, pdf)
         print(f"  -> Saved: {pdf_path} (+ per-image and summary AUC CSVs)")
     print(f"\nAll reports saved to '{OUT_DIR}'.")

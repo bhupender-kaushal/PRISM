@@ -12,25 +12,20 @@ import matplotlib.pyplot as plt
 # ==========================================
 # 1. EXPERIMENT CONFIGURATION
 # ==========================================
-# Result folders per model; replace these to evaluate runs stored elsewhere.
-RESULTS_ROOT = "/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/Pascal_VOC/results"
+# Result folders per model; edit PRISM_ROOT (or override the dicts below) to evaluate runs stored elsewhere.
+PRISM_ROOT = "/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM"
 
-ICOC_DIRS = {     # prism.py -> run_1/<img>/<img>_analysis.json with in/out_of_context_analysis
-    "SAMv1": f"{RESULTS_ROOT}/sam1/prism_out_icoc",
-    "SAMv2": f"{RESULTS_ROOT}/sam2/prism_out_icoc",
-    # "MSDUNet": "...", "TransFuse": "...", "D-LKA": "...", "TransDeeplab": "...", "CDARL": "...", "DARL": "...",
+# model -> (dataset folder, results subfolder, dataset name), as written by the PRISM scripts / slurm files
+MODELS = {
+    "TransDeepLab": ("Synapse", "transdeeplab", "Synapse"),
+    "D-LKA": ("Synapse", "dlka", "Synapse"),
 }
-GLOBAL_DIRS = {   # prism_global.py -> run_1/<img>/<img>_analysis.json with global_sota_analysis
-    "SAMv1": f"{RESULTS_ROOT}/sam1/prism_out_global",
-    "SAMv2": f"{RESULTS_ROOT}/sam2/prism_out_global",
-}
-ID_DIRS = {       # prism_sota.py -> <img>/<img>_analysis.json with prob_guided_analysis
-    "SAMv1": f"{RESULTS_ROOT}/sam1/prism_out_insertion_deletion",
-    "SAMv2": f"{RESULTS_ROOT}/sam2/prism_out_insertion_deletion",
-}
+ICOC_DIRS = {m: f"{PRISM_ROOT}/{ds}/results/{sub}/prism_out_icoc" for m, (ds, sub, _) in MODELS.items()}                  # prism.py
+GLOBAL_DIRS = {m: f"{PRISM_ROOT}/{ds}/results/{sub}/prism_out_global" for m, (ds, sub, _) in MODELS.items()}              # prism_global.py
+ID_DIRS = {m: f"{PRISM_ROOT}/{ds}/results/{sub}/prism_out_insertion_deletion" for m, (ds, sub, _) in MODELS.items()}      # prism_sota.py
 RUN_SUBDIR = "run_1"   # dataset-run folder written by prism.py / prism_global.py
 
-OUT_DIR = f"{RESULTS_ROOT}/meta_evaluation"
+OUT_DIR = f"{PRISM_ROOT}/Synapse/results/meta_evaluation"
 
 # Score families (paradigms) to evaluate
 PARADIGMS = {
@@ -275,6 +270,7 @@ def run_image_ranking_consistency(df_all):
                     print(pd.DataFrame(rank_matrix, index=pivot_clean.index, columns=pivot_clean.columns).to_string())
 
                 results.append({
+                    'Dataset': MODELS[model][2],
                     'Model': model,
                     'Paradigm': paradigm,
                     'Scheme': scheme,
