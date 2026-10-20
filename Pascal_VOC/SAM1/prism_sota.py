@@ -90,7 +90,8 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
                 indices = np.random.choice(len(rows), num_noise, replace=False)
                 perturbed_image[rows[indices], cols[indices], c] = np.random.choice([0.0, 1.0], num_noise)
     elif noise_type == 'poisson':
-        scale = max(0.05, 3.2 - noise_level) * 300.0
+        target_std = 0.1 * noise_level          # Poisson std on mid-grey matches the Gaussian std
+        scale = 0.5 / max(target_std, 1e-6) ** 2
         for c in range(C): perturbed_image[region_mask, c] = np.random.poisson(np.clip(perturbed_image[region_mask, c], 0, 1) * scale) / scale
     elif noise_type == 'speckle':
         for c in range(C): perturbed_image[region_mask, c] *= (1.0 + np.random.normal(0, 0.1 * noise_level, size=(H, W))[region_mask])
@@ -103,6 +104,8 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
             
     return np.clip(perturbed_image, 0.0, 1.0)
 
+CANVAS_LEVEL = 5.0   # noise level of the I/D noise canvases (top of the PRISM grid)
+
 def generate_baseline_canvas(orig_image_01, baseline_type):
     if baseline_type == 'black':
         return np.zeros_like(orig_image_01)
@@ -111,7 +114,7 @@ def generate_baseline_canvas(orig_image_01, baseline_type):
         return np.ones_like(orig_image_01) * mean_color
     else:
         dummy_all_mask = np.ones(orig_image_01.shape[:2], dtype=int)
-        return perturb_superpixels_with_level(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=30.0)
+        return perturb_superpixels_with_level(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=CANVAS_LEVEL)
 
 # --- NEW: Image Downsampling and Saving Helper ---
 def save_downsampled_image(arr, path, is_mask=False, size=(256, 256)):

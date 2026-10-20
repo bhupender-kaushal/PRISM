@@ -105,7 +105,6 @@ NOISE_PARAMS = {
     'gaussian_sigma': 0.1,         # std = 0.1 * level
     'speckle_sigma': 0.1,          # std = 0.1 * level
     'salt_pepper_density': 0.05,   # density = min(0.5, 0.05 * level)
-    'poisson_photons': 500.0,      # photons = 500 * max(0.05, 3.2 - level)
     'blur_sigma': 50.0,            # sigma = 50 * level
     'rician_sigma': 0.1,           # std = 0.1 * level
 }
@@ -143,9 +142,9 @@ def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, 
                 perturbed_image[rows[indices], cols[indices], c] = salt_pepper_vals
 
     elif noise_type == 'poisson':
-        intensity_scale = max(0.05, 3.2 - noise_level)
-        scale_factor = NOISE_PARAMS['poisson_photons'] * intensity_scale
-        noise_char_value = intensity_scale
+        target_std = NOISE_PARAMS['gaussian_sigma'] * noise_level          # Poisson std on mid-grey matches the Gaussian std
+        scale_factor = 0.5 / max(target_std, 1e-6) ** 2
+        noise_char_value = target_std
         for c in range(C):
             channel_data = perturbed_image[:, :, c]
             region_pixels = np.clip(channel_data[region_mask], 0.0, 1.0)
@@ -336,7 +335,7 @@ def run_ranking_analysis(
         conditional_bleed_count = 0
         peak_rp = 0.0
 
-        noise_levels_arr = np.arange(args.noise_step, 3.1, args.noise_step)
+        noise_levels_arr = np.round(np.arange(1, int(round(args.max_level / args.noise_step)) + 1) * args.noise_step, 4)
         pbar = tqdm(noise_levels_arr, desc=f"   -> [{analysis_type[:2].upper()}] {noise_type}", leave=False, position=1)
 
         for step_idx, noise_level in enumerate(pbar):
@@ -344,11 +343,6 @@ def run_ranking_analysis(
 
             perturbed_image_np_scaled, _ = perturb_superpixels_with_level(orig_image_np_01, segments_slic, superpixels_to_perturb, noise_type, noise_level)
             ssim_score = structural_similarity(orig_image_np_01, perturbed_image_np_scaled, data_range=1.0, channel_axis=-1)
-
-            # ---> STRICT SSIM CAPPING TRIGGER (0.70) <---
-            if ssim_score < 0.70:
-                logger.info(f"\n[SSIM TRIGGER] SSIM ({ssim_score:.4f}) dropped below 0.70 at {noise_type.upper()} level {noise_level:.2f}. Halting.")
-                break 
 
             perturbed_tensor = torch.from_numpy(perturbed_image_np_scaled).permute(2, 0, 1).float()
             normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -363,12 +357,12 @@ def run_ranking_analysis(
 
             # --- IMAGE SAVING AT 0.5 INTERVALS ---
             if save_visuals and int(round(noise_level, 2) * 100) % 50 == 0:
-                Image.fromarray((perturbed_image_np_scaled * 255).astype(np.uint8)).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}.png"))
-                Image.fromarray((perturbed_pred_mask * 255).astype(np.uint8)).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_mask.png"))
+                Image.fromarray((perturbed_image_np_scaled * 255).astype(np.uint8)).resize((256, 256), Image.BILINEAR).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}.png"))
+                Image.fromarray((perturbed_pred_mask * 255).astype(np.uint8)).resize((256, 256), Image.NEAREST).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_mask.png"))
                 
                 img_rgb = gray2rgb(perturbed_image_np_scaled) if perturbed_image_np_scaled.ndim == 2 else perturbed_image_np_scaled
                 overlay_image = mark_boundaries(img_rgb, perturbed_pred_mask, color=(1, 0, 0), mode='thick')
-                Image.fromarray((overlay_image * 255).astype(np.uint8)).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_overlay.png"))
+                Image.fromarray((overlay_image * 255).astype(np.uint8)).resize((256, 256), Image.BILINEAR).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_overlay.png"))
 
             # --- Global IoU at Step k ---
             intersect_k = np.sum((perturbed_pred_mask == 1) & (gt_mask > 0))
@@ -476,7 +470,8 @@ def main():
     parser.add_argument('--txtfile', type=str, default='/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/ISIC/img_sel.txt', help="Path to the selected images text file containing qualified image names.")
     parser.add_argument('--num_images', type=int, default=50, help="Target number of qualified images to find.")
     parser.add_argument('--num_dataset_runs', type=int, default=1, help="Number of dataset iterations for variance calculation.")
-    parser.add_argument('--noise_step', type=float, default=0.05, help="Step size for noise loop.")
+    parser.add_argument('--noise_step', type=float, default=0.1, help="Step size for noise loop.")
+    parser.add_argument('--max_level', type=float, default=5.0, help="Highest noise level of the grid (inclusive).")
     parser.add_argument('--superpixel_size', type=int, default=150)
     parser.add_argument('--noise_types', nargs='+', default=['gaussian', 'salt_pepper', 'poisson', 'speckle', 'gaussian_blur', 'rician'])
     parser.add_argument('--perturb_ratio', type=float, default=1.0)

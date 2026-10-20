@@ -9,6 +9,7 @@ from scipy.stats import rankdata, gaussian_kde
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 # ==========================================
 # 1. EXPERIMENT CONFIGURATION
@@ -348,6 +349,16 @@ def perturbation_name(label):
     name = 'Salt & Pepper' if base == 'salt_pepper' else base.replace('_', ' ').title()
     return f"{name}#{rep}" if rep else name
 
+def format_score_axis(ax, paradigm, perts):
+    ax.set_xticks(range(len(perts)))
+    ax.set_xticklabels([perturbation_name(p) for p in perts], rotation=30, ha='right')
+    ax.set_xlim(-0.6, len(perts) - 0.4)
+    ax.set_title(paradigm.replace(' (', '\n(') if len(perts) < 4 else paradigm, fontsize=12, fontweight='bold')
+    ax.set_ylabel("Score" if paradigm.startswith('S-Factor') else "AUC", fontsize=11)
+    ax.grid(True, color="#dddddd", lw=0.6)
+    ax.set_axisbelow(True)
+    for s in ("top", "right"): ax.spines[s].set_visible(False)
+
 def plot_model_scores(model, m_df):
     """Per-image score distributions at SCORE_LEVEL: one panel per paradigm, x = perturbation, one candle per rater."""
     lvl = frac_label(SCORE_LEVEL)
@@ -366,14 +377,7 @@ def plot_model_scores(model, m_df):
             v = p_df.loc[p_df['perturbation'] == pert, 'score'].dropna().values
             draw_half_violin(ax, x, v, -1, color)
             draw_half_violin(ax, x, v, +1, color)
-        ax.set_xticks(range(len(perts[paradigm])))
-        ax.set_xticklabels([perturbation_name(p) for p in perts[paradigm]], rotation=30, ha='right')
-        ax.set_xlim(-0.6, len(perts[paradigm]) - 0.4)
-        ax.set_title(paradigm.replace(' (', '\n(') if len(perts[paradigm]) < 4 else paradigm, fontsize=12, fontweight='bold')
-        ax.set_ylabel("Score" if paradigm.startswith('S-Factor') else "AUC", fontsize=11)
-        ax.grid(True, color="#dddddd", lw=0.6)
-        ax.set_axisbelow(True)
-        for s in ("top", "right"): ax.spines[s].set_visible(False)
+        format_score_axis(ax, paradigm, perts[paradigm])
     n_img = m_df['image_id'].nunique()
     fig.suptitle(f"Per-Image Score Distributions: {model} (levels {lvl}, {n_img} images)", fontsize=16, fontweight='bold', y=1.0)
     fig.legend(handles=[Line2D([], [], color="#222222", lw=1.4, label="median"),
@@ -381,6 +385,41 @@ def plot_model_scores(model, m_df):
                loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 0.95))
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     pdf_path = os.path.join(OUT_DIR, f"Fig_{model}_Score_Distributions.pdf")
+    fig.savefig(pdf_path, format='pdf', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  -> Saved: {pdf_path}")
+
+MODEL_COLORS = ['#4c72b0', '#dd8452']   # left / right half of the model-comparison candles
+
+def plot_dataset_comparison(dataset, models, d_df):
+    """Per-image score distributions at SCORE_LEVEL for the two models of one dataset:
+    split candle per perturbation, left half = models[0], right half = models[1]."""
+    lvl = frac_label(SCORE_LEVEL)
+    d_df = d_df[d_df['level'] == lvl]
+    paradigms = [p for p in PARADIGMS if p in set(d_df['paradigm'])]
+    if not paradigms:
+        print(f"  -> No scores at level {lvl} for {dataset}; skipping model comparison.")
+        return
+    perts = {p: list(dict.fromkeys(d_df.loc[d_df['paradigm'] == p, 'perturbation'])) for p in paradigms}
+    widths = [len(perts[p]) for p in paradigms]
+    fig, axes = plt.subplots(1, len(paradigms), figsize=(0.95 * sum(widths) + 3, 5), squeeze=False,
+                             gridspec_kw={'width_ratios': widths})
+    for ax, paradigm in zip(axes[0], paradigms):
+        p_df = d_df[d_df['paradigm'] == paradigm]
+        for x, pert in enumerate(perts[paradigm]):
+            for model, side, color in zip(models, (-1, +1), MODEL_COLORS):
+                v = p_df.loc[(p_df['perturbation'] == pert) & (p_df['model'] == model), 'score'].dropna().values
+                draw_half_violin(ax, x, v, side, color)
+        format_score_axis(ax, paradigm, perts[paradigm])
+    n_img = {m: d_df.loc[d_df['model'] == m, 'image_id'].nunique() for m in models}
+    handles = [Patch(facecolor=c, alpha=0.55, label=f"{m} ({n_img[m]} images)") for m, c in zip(models, MODEL_COLORS)]
+    handles += [Line2D([], [], color="#222222", lw=1.4, label="median"),
+                Line2D([], [], color="#222222", lw=0.9, ls="--", label="quartiles")]
+    fig.suptitle(f"Per-Image Score Distributions: {dataset}, {models[0]} vs {models[1]} (levels {lvl})",
+                 fontsize=16, fontweight='bold', y=1.0)
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False, bbox_to_anchor=(0.5, 0.95))
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    pdf_path = os.path.join(OUT_DIR, f"Fig_{dataset.replace(' ', '_')}_Model_Comparison_Score_Distributions.pdf")
     fig.savefig(pdf_path, format='pdf', dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"  -> Saved: {pdf_path}")
@@ -404,6 +443,12 @@ if __name__ == "__main__":
         print(f"\n>>> Generating per-model score distributions (levels {frac_label(SCORE_LEVEL)})...")
         for model, m_df in df_all.groupby('model', sort=False):
             plot_model_scores(model, m_df)
+        for dataset in dict.fromkeys(ds for _, _, ds in MODELS.values()):
+            models = [m for m, (_, _, ds) in MODELS.items() if ds == dataset and m in set(df_all['model'])]
+            if len(models) == 2:
+                plot_dataset_comparison(dataset, models, df_all[df_all['model'].isin(models)])
+            else:
+                print(f"  -> {dataset}: model comparison needs exactly 2 models with scores (found {len(models)}); skipping.")
 
         print("\n>>> Calculating Kendall's W and Spearman's Rho...")
         w_results = run_image_ranking_consistency(df_all)

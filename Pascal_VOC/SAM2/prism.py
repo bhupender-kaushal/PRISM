@@ -117,9 +117,9 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
                 perturbed_image[rows[indices], cols[indices], c] = salt_pepper_vals
 
     elif noise_type == 'poisson':
-        intensity_scale = max(0.05, 3.2 - noise_level)
-        scale_factor = 300.0 * intensity_scale
-        noise_char_value = intensity_scale
+        target_std = 0.1 * noise_level          # Poisson std on mid-grey matches the Gaussian std
+        scale_factor = 0.5 / max(target_std, 1e-6) ** 2
+        noise_char_value = target_std
         for c in range(C):
             channel_data = perturbed_image[:, :, c]
             region_pixels = np.clip(channel_data[region_mask], 0.0, 1.0)
@@ -315,7 +315,7 @@ def run_ranking_analysis(
     superpixels_to_perturb, superpixels_to_measure,
     noise_types, noise_char_map, current_image_output_dir, 
     initial_pred_mask, initial_probs, best_channel_index, 
-    ic_sps_all, oc_sps_all, noise_step=0.05, save_visuals=False, alpha=1.0, beta=1.0
+    ic_sps_all, oc_sps_all, noise_step=0.05, max_level=5.0, save_visuals=False, alpha=1.0, beta=1.0
 ):
     logger = logging.getLogger('base')
     analysis_results = {
@@ -404,7 +404,7 @@ def run_ranking_analysis(
         conditional_bleed_count = 0
         peak_rp = 0.0
 
-        noise_levels_arr = np.arange(noise_step, 3.1, noise_step)
+        noise_levels_arr = np.round(np.arange(1, int(round(max_level / noise_step)) + 1) * noise_step, 4)
         pbar = tqdm(noise_levels_arr, desc=f"   -> [{analysis_type[:2].upper()}] {noise_type}", leave=False)
         
         for step_idx, noise_level in enumerate(pbar): 
@@ -414,8 +414,6 @@ def run_ranking_analysis(
                 orig_image_01, segments_slic, superpixels_to_perturb, noise_type, noise_level
             )
             ssim_score = structural_similarity(orig_image_01, perturbed_image_01, data_range=1.0, channel_axis=-1)
-            
-            if ssim_score < 0.70: break 
 
             perturbed_batch = batch.copy()
             perturbed_batch['image_tensor'] = to_tensor_transform(perturbed_image_01).unsqueeze(0).float()
@@ -530,7 +528,8 @@ def main():
     parser.add_argument('--txtfile', type=str, default='./img_sel.txt', help="Path to frozen image cohort text file.")    
     parser.add_argument('--num_images', type=int, default=50, help="Target qualified images.")
     parser.add_argument('--num_dataset_runs', type=int, default=1, help="Dataset iterations.")
-    parser.add_argument('--noise_step', type=float, default=0.05, help="Step size for noise perturbation loop.")
+    parser.add_argument('--noise_step', type=float, default=0.1, help="Step size for noise perturbation loop.")
+    parser.add_argument('--max_level', type=float, default=5.0, help="Highest noise level of the grid (inclusive).")
     parser.add_argument('--image_size', type=int, nargs=2, default=[512, 1024])
     parser.add_argument('--target_class', type=str, default='person')
     args = parser.parse_args()
@@ -550,7 +549,7 @@ def main():
     noise_types = ['poisson', 'gaussian', 'speckle', 'salt_pepper', 'gaussian_blur', 'rician']
     noise_char_map = {
         'salt_pepper': 'density', 'gaussian': 'std_dev', 'speckle': 'std_dev', 
-        'poisson': 'intensity_scale', 'gaussian_blur': 'sigma', 'rician': 'sigma'
+        'poisson': 'std_at_midgrey', 'gaussian_blur': 'sigma', 'rician': 'sigma'
     }
 
     # =========================================================================
@@ -633,7 +632,7 @@ def main():
                 'in_context', model_wrapper, batch, orig_image_01, gt_mask, segments_slic, 
                 ic_sps_all, ic_sps_all, noise_types, noise_char_map, 
                 current_image_output_dir, pred_mask, initial_probs, best_channel_index, 
-                ic_sps_all, oc_sps_all, noise_step=args.noise_step, save_visuals=(run_idx == 0)
+                ic_sps_all, oc_sps_all, noise_step=args.noise_step, max_level=args.max_level, save_visuals=(run_idx == 0)
             )
             final_analysis['in_context_analysis'] = res_ic
 
@@ -645,7 +644,7 @@ def main():
                 'out_of_context', model_wrapper, batch, orig_image_01, gt_mask, segments_slic, 
                 out_of_context_sp_to_perturb, ic_sps_all, noise_types, noise_char_map, 
                 current_image_output_dir, pred_mask, initial_probs, best_channel_index, 
-                ic_sps_all, oc_sps_all, noise_step=args.noise_step, save_visuals=(run_idx == 0)
+                ic_sps_all, oc_sps_all, noise_step=args.noise_step, max_level=args.max_level, save_visuals=(run_idx == 0)
             )
             final_analysis['out_of_context_analysis'] = res_oc
 

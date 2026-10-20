@@ -105,7 +105,6 @@ NOISE_PARAMS = {
     'gaussian_sigma': 0.1,         # std = 0.1 * level
     'speckle_sigma': 0.1,          # std = 0.1 * level
     'salt_pepper_density': 0.05,   # density = min(0.5, 0.05 * level)
-    'poisson_photons': 100.0,      # photons = 100 * max(0.05, 3.2 - level)
     'blur_sigma': 10.0,            # sigma = 10 * level
     'rician_sigma': 0.05,          # std = 0.05 * level
 }
@@ -135,7 +134,8 @@ def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_lev
             perturbed_image[rows[indices], cols[indices]] = np.random.choice([0.0, 1.0], num_noise)
             
     elif noise_type == 'poisson':
-        photons = NOISE_PARAMS['poisson_photons'] * max(0.05, 3.2 - noise_level)
+        target_std = NOISE_PARAMS['gaussian_sigma'] * noise_level          # Poisson std on mid-grey matches the Gaussian std
+        photons = 0.5 / max(target_std, 1e-6) ** 2
         region = perturbed_image[region_mask]
         noisy_region = np.random.poisson(np.clip(region, 0, 1) * photons) / photons
         perturbed_image[region_mask] = noisy_region
@@ -168,6 +168,8 @@ def save_downsampled_image(arr, path, is_mask=False, size=(256, 256)):
     img = img.resize(size, Image.NEAREST if is_mask else Image.BILINEAR)
     img.save(path)
 
+CANVAS_LEVEL = 5.0   # noise level of the I/D noise canvases (top of the PRISM grid)
+
 def generate_baseline_canvas(orig_image_01, baseline_type):
     """Generates the Null-Information canvas (Black, Mean, or Max-Noise) for I/D."""
     if baseline_type == 'black':
@@ -178,7 +180,7 @@ def generate_baseline_canvas(orig_image_01, baseline_type):
     else:
         # Generate the fully saturated noisy background for the 6 noise variants
         dummy_all_mask = np.ones_like(orig_image_01, dtype=int)
-        return perturb_image_slice(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=30.0)
+        return perturb_image_slice(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=CANVAS_LEVEL)
 
 def predict_slice_swindeeplab(model, image_slice_01, patch_size, target_class_index, device='cuda'):
     """SwinDeepLab-specific inference routing extracting multiclass target probabilities."""

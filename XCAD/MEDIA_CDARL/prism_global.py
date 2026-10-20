@@ -78,7 +78,6 @@ NOISE_PARAMS = {
     'gaussian_sigma': 0.1,         # std = 0.1 * level
     'speckle_sigma': 0.1,          # std = 0.1 * level
     'salt_pepper_density': 0.05,   # density = min(0.5, 0.05 * level)
-    'poisson_photons': 300.0,      # photons = 300 * max(0.05, 3.2 - level)
     'blur_sigma': 10.0,            # sigma = 10 * level
     'rician_sigma': 0.1,           # std = 0.1 * level
 }
@@ -108,7 +107,8 @@ def perturb_image_slice(image_01, segments, sp_to_perturb, noise_type, noise_lev
             perturbed_image[rows[indices], cols[indices]] = np.random.choice([0.0, 1.0], num_noise)
             
     elif noise_type == 'poisson':
-        photons = NOISE_PARAMS['poisson_photons'] * max(0.05, 3.2 - noise_level)
+        target_std = NOISE_PARAMS['gaussian_sigma'] * noise_level          # Poisson std on mid-grey matches the Gaussian std
+        photons = 0.5 / max(target_std, 1e-6) ** 2
         region = perturbed_image[region_mask]
         noisy_region = np.random.poisson(np.clip(region, 0, 1) * photons) / photons
         perturbed_image[region_mask] = noisy_region
@@ -219,7 +219,7 @@ def run_ranking_analysis(
     analysis_type, model_diffusion, device, val_data, orig_image_01, segments, target_class_gt,
     superpixels_to_perturb, superpixels_to_measure, initial_pred_mask_bool,
     noise_types, current_image_output_dir, initial_probs, ic_sps_all, oc_sps_all,
-    noise_step=0.05, save_visuals=False, alpha=1.0, beta=1.0
+    noise_step=0.05, max_level=5.0, save_visuals=False, alpha=1.0, beta=1.0
 ):
     logger = logging.getLogger('base')
     analysis_results = {
@@ -316,7 +316,7 @@ def run_ranking_analysis(
         conditional_bleed_count = 0
         peak_rp = 0.0
 
-        noise_levels_arr = np.arange(noise_step, 3.1, noise_step)
+        noise_levels_arr = np.round(np.arange(1, int(round(max_level / noise_step)) + 1) * noise_step, 4)
         pbar = tqdm(noise_levels_arr, desc=f"   -> [{analysis_type[:2].upper()}] {noise_type}", leave=False, position=1)
         
         for step_idx, noise_level in enumerate(pbar): 
@@ -330,14 +330,14 @@ def run_ranking_analysis(
 
             # --- IMAGE SAVING AT 0.5 INTERVALS ---
             if save_visuals and int(round(noise_level, 2) * 100) % 50 == 0:
-                Image.fromarray((perturbed_img_gray * 255).astype(np.uint8)).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}.png"))
+                Image.fromarray((perturbed_img_gray * 255).astype(np.uint8)).resize((256, 256), Image.BILINEAR).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}.png"))
                 mask_to_save = (perturbed_pred_mask_bool * 255).astype(np.uint8)
-                Image.fromarray(mask_to_save).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_mask.png"))
+                Image.fromarray(mask_to_save).resize((256, 256), Image.NEAREST).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_mask.png"))
                 
                 img_rgb = gray2rgb(perturbed_img_gray) if perturbed_img_gray.ndim == 2 else perturbed_img_gray
                 overlay_image = mark_boundaries(img_rgb, perturbed_pred_mask_bool, color=(1, 0, 0), mode='thick')
                 overlay_to_save = (overlay_image * 255).astype(np.uint8)
-                Image.fromarray(overlay_to_save).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_overlay.png"))
+                Image.fromarray(overlay_to_save).resize((256, 256), Image.BILINEAR).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_overlay.png"))
 
             # --- Global IoU at Step k ---
             intersect_k = np.sum((perturbed_pred_mask_bool == 1) & (target_class_gt == 1))
@@ -447,7 +447,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="/cluster/home/bhupenk/bhupender/current_projects/2026/PRISM/XCAD/results/cdarl/prism_out_global")
     parser.add_argument("--num_images", type=int, default=50, help="Target number of qualified images to find.")
     parser.add_argument("--num_dataset_runs", type=int, default=1, help="Dataset iterations.")
-    parser.add_argument("--noise_step", type=float, default=0.05, help="Step size for noise loop.")
+    parser.add_argument("--noise_step", type=float, default=0.1, help="Step size for noise loop.")
+    parser.add_argument("--max_level", type=float, default=5.0, help="Highest noise level of the grid (inclusive).")
     parser.add_argument("--num_superpixels", type=int, default=500)
     parser.add_argument("--noise_types", nargs='+', default=['gaussian', 'salt_pepper', 'poisson', 'speckle', 'gaussian_blur', 'rician'])
     parser.add_argument('--target_layer_names', nargs='+', default=['Conv'])
@@ -595,7 +596,7 @@ def main():
                 initial_probs=initial_probs, 
                 ic_sps_all=ic_sps_all, 
                 oc_sps_all=oc_sps_all, 
-                noise_step=args.noise_step, 
+                noise_step=args.noise_step, max_level=args.max_level, 
                 save_visuals=(run_idx == 0)
             )
             final_analysis['global_sota_analysis'] = res_global

@@ -127,7 +127,6 @@ NOISE_PARAMS = {
     'gaussian_sigma': 0.1,         # std = 0.1 * level
     'speckle_sigma': 0.1,          # std = 0.1 * level
     'salt_pepper_density': 0.05,   # density = min(0.5, 0.05 * level)
-    'poisson_photons': 500.0,      # photons = 500 * max(0.05, 3.2 - level)
     'blur_sigma': 50.0,            # sigma = 50 * level
     'rician_sigma': 0.1,           # std = 0.1 * level
 }
@@ -165,9 +164,9 @@ def perturb_superpixels_with_level(original_image_scaled, superpixels_segments, 
                 perturbed_image[rows[indices], cols[indices], c] = salt_pepper_vals
 
     elif noise_type == 'poisson':
-        intensity_scale = max(0.05, 3.2 - noise_level)
-        scale_factor = NOISE_PARAMS['poisson_photons'] * intensity_scale
-        noise_char_value = intensity_scale
+        target_std = NOISE_PARAMS['gaussian_sigma'] * noise_level          # Poisson std on mid-grey matches the Gaussian std
+        scale_factor = 0.5 / max(target_std, 1e-6) ** 2
+        noise_char_value = target_std
         for c in range(C):
             channel_data = perturbed_image[:, :, c]
             region_pixels = np.clip(channel_data[region_mask], 0.0, 1.0)
@@ -214,6 +213,8 @@ def save_downsampled_image(arr, path, is_mask=False, size=(256, 256)):
     img = img.resize(size, Image.NEAREST if is_mask else Image.BILINEAR)
     img.save(path)
 
+CANVAS_LEVEL = 5.0   # noise level of the I/D noise canvases (top of the PRISM grid)
+
 def generate_baseline_canvas(orig_image_01, baseline_type):
     """Generates the Null-Information canvas (Black, Mean, or Max-Noise) for I/D."""
     if baseline_type == 'black':
@@ -224,7 +225,7 @@ def generate_baseline_canvas(orig_image_01, baseline_type):
     else:
         # Generate the fully saturated noisy background for the 6 noise variants
         dummy_all_mask = np.ones(orig_image_01.shape[:2], dtype=int)
-        return perturb_superpixels_with_level(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=30.0)[0]
+        return perturb_superpixels_with_level(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=CANVAS_LEVEL)[0]
 
 def predict_from_numpy(model_instance, img_np_01, device, gt_shape):
     """TransFuse-specific helper to maintain ImageNet normalization during I/D steps."""
