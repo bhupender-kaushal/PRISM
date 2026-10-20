@@ -372,7 +372,7 @@ def run_ranking_analysis(
     max_possible_jumps = math.floor((N_measured**2) / 2.0) if N_measured > 1 else 1.0
 
     base_raw_mean_prob = np.mean([sp['mean_prob'] for sp in sorted_initial_sp_data]) if sorted_initial_sp_data else 0.0
-    base_utility_e0 = base_raw_mean_prob * 100.0
+    base_utility_e0 = base_global_iou          # utility is IoU-based; probability is only used to rank superpixels
 
     for noise_type in noise_types:
         if save_visuals:
@@ -478,7 +478,7 @@ def run_ranking_analysis(
 
             # --- Step-Wise Discounted Utility (E_k) ---
             raw_prob_mean_k = np.mean([sp['mean_prob'] for sp in sorted_superpixels]) if sorted_superpixels else 0.0
-            e_k = raw_prob_mean_k * (1.0 - alpha * min(1.0, norm_rp_k)) * max(0.0, 1.0 - beta * spillover_ratio_k) * 100.0
+            e_k = global_iou_k * (1.0 - alpha * min(1.0, norm_rp_k)) * max(0.0, 1.0 - beta * spillover_ratio_k)
 
             level_data_list.append({
                 "step_idx": step_idx + 1,

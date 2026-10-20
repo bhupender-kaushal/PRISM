@@ -4,11 +4,13 @@ Relative-measure assessment: every method scored on RELATIVE change w.r.t. the c
 Builds on assessment_global.py (models, result folders, level fractions, rater schemes,
 Kendall's W / Spearman engines and figures) and runs it twice:
 
-  raw/       the methods as assessment_global.py scores them
-             (S-Factor, Global AUC on IoU/100, I/D AUC on IoU/100)
-  relative/  every method measured as relative change:
-             S-Factor (IC/OC)           unchanged (already relative to step 0)
-             S-Factor new (utility)     100 * D_ic * I_oc on discounted_utility
+  raw/       the methods as assessment_global.py scores them (Global AUC and I/D AUC on IoU/100),
+             except the S-Factor, which is rebuilt on IoU instead of probability:
+             E_k = IoU_k * (1 - rank_perplexity_k) * max(0, 1 - spillover_k)   (same as prism.py's utility;
+             probability only ranks the superpixels for rank_perplexity)
+  relative/  every method measured as relative change in IoU vs GT:
+             S-Factor (IC/OC, IoU)      the original S-factor formula fed only global_iou
+                                        (global IoU should drop under IC and stay stable under OC perturbation)
              S-Factor new (IoU)         100 * D_ic * I_oc on global_iou
              Global AUC (relative)      area under min(1, IoU_k / IoU_0)
              I/D Deletion (relative)    area under min(1, IoU / clean IoU)   (clean = deletion step 0)
@@ -57,13 +59,15 @@ import assessment_global as A
 OUT_DIR = f"{A.PRISM_ROOT}/Results/relative_assessment"
 SAVE_PNG = True     # also save a PNG next to every PDF figure
 
-REL_PARADIGMS = ['S-Factor (IC/OC)', 'S-Factor new (utility)', 'S-Factor new (IoU)',
+REL_PARADIGMS = ['S-Factor (IC/OC, IoU)', 'S-Factor new (IoU)',
                  'Global AUC (relative)', 'I/D Deletion (relative)', 'I/D Insertion (relative)']
-REL_PALETTE = {'S-Factor (IC/OC)': '#1f77b4', 'S-Factor new (utility)': '#9467bd', 'S-Factor new (IoU)': '#17becf',
+REL_PALETTE = {'S-Factor (IC/OC, IoU)': '#1f77b4', 'S-Factor new (IoU)': '#17becf',
                'Global AUC (relative)': '#2ca02c', 'I/D Deletion (relative)': '#d62728', 'I/D Insertion (relative)': '#ff7f0e'}
 
 # Row order of the summary tables: each raw method next to its relative version
-SUMMARY_ORDER = ['S-Factor (IC/OC)', 'S-Factor new (utility)', 'S-Factor new (IoU)',
+# ('S-Factor (IC/OC)' = raw S-factor on the IoU-based utility, with rank-perplexity and spillover penalties;
+#  'S-Factor (IC/OC, IoU)' = the same formula on IoU alone)
+SUMMARY_ORDER = ['S-Factor (IC/OC)', 'S-Factor (IC/OC, IoU)', 'S-Factor new (IoU)',
                  'Global Continuous AUC', 'Global AUC (relative)',
                  'Standard I/D AUC (Deletion)', 'I/D Deletion (relative)',
                  'Standard I/D AUC (Insertion)', 'I/D Insertion (relative)']
@@ -89,6 +93,39 @@ def new_score(ic_levels, oc_levels, field):
     d_ic = 1 - np.sum(w * I[1:N] / max(1e-6, I[0])) / w.sum()
     i_oc = 1 - np.sum(w * np.abs(O[1:N] / max(1e-6, O[0]) - 1)) / w.sum()
     return 100 * float(np.clip(d_ic, 0, 1) * np.clip(i_oc, 0, 1))
+
+def iou_only(levels):
+    """Keep only global_iou, so calculate_holistic_s_factor scores IoU instead of discounted_utility."""
+    return [{'global_iou': float(l['global_iou'])} for l in levels]
+
+def iou_utility(levels):
+    """prism.py's step utility rebuilt on IoU: IoU_k * (1 - rank_perplexity_k) * max(0, 1 - spillover_k).
+    Independent of the discounted_utility stored in the JSON, so older (probability-based) runs score the same."""
+    return [{'discounted_utility': float(l['global_iou']) * (1.0 - min(1.0, float(l.get('rank_perplexity', 0.0))))
+                                   * max(0.0, 1.0 - float(l.get('instant_spillover_ratio', 0.0)))} for l in levels]
+
+def extract_raw_sfactor_iou():
+    """Raw S-Factor (IC/OC) with the IoU-based utility, in assessment_global.py's record format."""
+    records, skipped = [], Counter()
+    noises, levels = A.labelled(A.NOISES), A.labelled(A.LEVEL_FRACTIONS, A.frac_label)
+    for model in A.MODELS:
+        for image_id, data in A.load_jsons(A.ICOC_DIRS[model], f"{A.RUN_SUBDIR}/*/*_analysis.json", skipped, f"{model} IC/OC"):
+            try:
+                ic = data['in_context_analysis']['level_data_per_noise']
+                oc = data['out_of_context_analysis']['level_data_per_noise']
+            except KeyError:
+                continue
+            for noise, noise_lbl in noises:
+                if noise not in ic or noise not in oc: continue
+                ic_lvls, oc_lvls = ic[noise]['level_data'], oc[noise]['level_data']
+                n = min(len(ic_lvls), len(oc_lvls))
+                for frac, lvl_lbl in levels:
+                    score = A.calculate_holistic_s_factor(iou_utility(A.truncate_levels(ic_lvls[:n], frac)),
+                                                          iou_utility(A.truncate_levels(oc_lvls[:n], frac)))
+                    if not np.isnan(score):
+                        records.append({'model': model, 'image_id': image_id, 'paradigm': 'S-Factor (IC/OC)',
+                                        'perturbation': noise_lbl, 'level': lvl_lbl, 'score': score})
+    return pd.DataFrame(records)
 
 def global_auc_rel(levels, frac):
     """A.global_auc with IoU divided by the clean (step 0) IoU instead of 100;
@@ -130,8 +167,8 @@ def extract_relative_scores():
                 n = min(len(ic_lvls), len(oc_lvls))
                 for frac, lvl_lbl in levels:
                     ti, to = A.truncate_levels(ic_lvls[:n], frac), A.truncate_levels(oc_lvls[:n], frac)
-                    add(model, image_id, 'S-Factor (IC/OC)', noise_lbl, lvl_lbl, A.calculate_holistic_s_factor(ti, to))
-                    add(model, image_id, 'S-Factor new (utility)', noise_lbl, lvl_lbl, new_score(ti, to, 'discounted_utility'))
+                    add(model, image_id, 'S-Factor (IC/OC, IoU)', noise_lbl, lvl_lbl,
+                        A.calculate_holistic_s_factor(iou_only(ti), iou_only(to)))
                     add(model, image_id, 'S-Factor new (IoU)', noise_lbl, lvl_lbl, new_score(ti, to, 'global_iou'))
 
         for image_id, data in A.load_jsons(A.GLOBAL_DIRS[model], f"{A.RUN_SUBDIR}/*/*_analysis.json", skipped, f"{model} Global"):
@@ -391,22 +428,21 @@ if __name__ == "__main__":
 
     print(f">>> Extracting raw scores | Noises: {A.NOISES} | Level fractions: {A.LEVEL_FRACTIONS}")
     df_raw = A.extract_all_scores()
+    # replace the S-Factor read from the stored (possibly probability-based) utility by the IoU-based one
+    df_raw = pd.concat([df_raw[df_raw['paradigm'] != 'S-Factor (IC/OC)'], extract_raw_sfactor_iou()], ignore_index=True)
     w_raw, sep_raw, mwu_raw = run_version("raw", df_raw, list(A.PARADIGMS), {})
 
     print("\n>>> Extracting relative scores")
     df_rel = extract_relative_scores()
     w_rel, sep_rel, mwu_rel = run_version("relative", df_rel, REL_PARADIGMS, REL_PALETTE)
 
-    # Side-by-side summaries (the original S-Factor appears once: it is identical in both versions)
-    w_all = pd.concat([w_raw.assign(Version='raw'),
-                       w_rel[w_rel['Paradigm'] != 'S-Factor (IC/OC)'].assign(Version='relative')])
+    # Side-by-side summaries: raw methods next to their relative IoU versions
+    w_all = pd.concat([w_raw.assign(Version='raw'), w_rel.assign(Version='relative')])
     w_all = w_all[w_all['Scheme'] == 'perturbation']
     w_all.drop(columns='Raters').to_csv(os.path.join(OUT_DIR, "Summary_Kendalls_W.csv"), index=False)
-    sep_all = pd.concat([sep_raw.assign(Version='raw'),
-                         sep_rel[sep_rel['Paradigm'] != 'S-Factor (IC/OC)'].assign(Version='relative')])
+    sep_all = pd.concat([sep_raw.assign(Version='raw'), sep_rel.assign(Version='relative')])
     sep_all.round(4).to_csv(os.path.join(OUT_DIR, "Summary_Model_Separation.csv"), index=False)
-    mwu_all = pd.concat([mwu_raw.assign(Version='raw'),
-                         mwu_rel[mwu_rel['Paradigm'] != 'S-Factor (IC/OC)'].assign(Version='relative')])
+    mwu_all = pd.concat([mwu_raw.assign(Version='raw'), mwu_rel.assign(Version='relative')])
     mwu_all.round(6).to_csv(os.path.join(OUT_DIR, "Summary_Model_MannWhitney.csv"), index=False)
     plot_mwu_overview(mwu_all, SUMMARY_ORDER, os.path.join(OUT_DIR, "Fig_Summary_MannWhitney_Overview.pdf"))
     plot_mwu_per_perturbation(mwu_all, SUMMARY_ORDER, A.frac_label(A.SCORE_LEVEL),
