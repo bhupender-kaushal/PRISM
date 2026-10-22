@@ -17,6 +17,18 @@ Outputs in OUT_DIR:
                                         vs noise level, one column per noise; IC and OC median + IQR band
     Fig_All_Models_RP_by_Level.pdf/.png rank perplexity vs noise level: rows = models, columns = noises
     Penalties_By_Level.csv              median / q1 / q3 of RP and spillover per model x noise x domain x level
+
+All methods (one value per image and perturbation, RP = mean over the perturbed steps):
+    PRISM IC/OC   as above (IC superpixels ranked; IC | OC split)
+    Global        prism_global.py: stored rank_perplexity (all superpixels ranked, whole image perturbed)
+                  and stored conditional_average_spillover
+    I/D Deletion / Insertion   prism_sota.py, black / mean canvas: RP recomputed from the stored per-step
+                  superpixel probabilities (IC superpixels, ranked by (mean_prob, area) as in prism.py) against
+                  the clean ranking (deletion step 0), / floor(Z^2/2); CSR = conditional average of the increase
+                  in background leakage (spillover_ratio_k - spillover_ratio_clean, steps > 0)
+    Fig_All_Methods_RP.pdf/.png         rank perplexity: rows = models, column groups = methods
+    Fig_All_Methods_CSR.pdf/.png        CSR, same layout
+    Penalties_All_Methods.csv           model, image_id, method, condition, domain, RP, CSR
 """
 import os
 from collections import Counter
@@ -65,6 +77,100 @@ def extract():
                     rows.append({'model': model, 'image_id': image_id, 'noise': noise, 'domain': domain, 'RP': rp, 'CSR': csr})
     for reason, count in sorted(skipped.items()): print(f"  skipped {count:5d} x {reason}")
     return pd.DataFrame(rows)
+
+def conditional_mean(values):
+    pos = [v for v in values if v > 0]
+    return sum(pos) / len(pos) if pos else 0.0
+
+def ranks_of(superpixels):
+    """IC superpixel ranks at one step, ranked by (mean_prob, area) descending as in prism.py."""
+    ordered = sorted(superpixels, key=lambda sp: (sp['mean_prob'], sp['area']), reverse=True)
+    return {sp['sp_id']: r for r, sp in enumerate(ordered, 1)}
+
+def id_penalties(traj, clean_ranks, clean_spill):
+    """Mean rank perplexity over the perturbed steps and CSR of one I/D trajectory."""
+    Z = len(clean_ranks)
+    if Z < 2 or len(traj) < 2: return np.nan, np.nan
+    max_jumps = (Z * Z) // 2
+    rps, spills = [], []
+    for step in traj:
+        if float(step.get('fraction_perturbed', 0.0)) <= 0: continue          # the unperturbed / empty-canvas start
+        rk = ranks_of(step.get('superpixels', []))
+        rps.append(sum(abs(rk[s] - clean_ranks[s]) for s in clean_ranks if s in rk) / max_jumps)
+        spills.append(max(0.0, float(step.get('spillover_ratio', 0.0)) - clean_spill))
+    return (float(np.mean(rps)) if rps else np.nan), conditional_mean(spills)
+
+def extract_all_methods(df_icoc):
+    """RP and CSR per image for every method; PRISM IC/OC rows come from extract()."""
+    rows = [dict(model=r.model, image_id=r.image_id, method='PRISM IC/OC', condition=r.noise, domain=r.domain,
+                 RP=r.RP, CSR=r.CSR) for r in df_icoc.itertuples()]
+    skipped = Counter()
+    for model in A.MODELS:
+        for image_id, data in A.load_jsons(A.GLOBAL_DIRS[model], f"{A.RUN_SUBDIR}/*/*_analysis.json", skipped, f"{model} Global"):
+            per_noise = data.get('global_sota_analysis', {}).get('level_data_per_noise', {})
+            for noise in A.NOISES:
+                if noise not in per_noise: continue
+                rp, csr = curve_penalties(per_noise[noise])
+                rows.append(dict(model=model, image_id=image_id, method='Global', condition=noise, domain='all', RP=rp, CSR=csr))
+        for image_id, data in A.load_jsons(A.ID_DIRS[model], "*/*_analysis.json", skipped, f"{model} I/D"):
+            trajectories = data.get('prob_guided_analysis', {}).get('trajectories', {})
+            for base in A.ID_BASELINES:
+                t = trajectories.get(base, {}).get('prob_ranked')
+                if not t or not t.get('deletion'): continue
+                clean = t['deletion'][0]                                     # fraction 0 = unperturbed image
+                clean_ranks, clean_spill = ranks_of(clean.get('superpixels', [])), float(clean.get('spillover_ratio', 0.0))
+                for method, key in (('I/D Deletion', 'deletion'), ('I/D Insertion', 'insertion')):
+                    rp, csr = id_penalties(t[key], clean_ranks, clean_spill)
+                    rows.append(dict(model=model, image_id=image_id, method=method, condition=base, domain='all', RP=rp, CSR=csr))
+    return pd.DataFrame(rows)
+
+METHOD_COLUMNS = [('PRISM IC/OC', A.NOISES), ('Global', A.NOISES),
+                  ('I/D Deletion', A.ID_BASELINES), ('I/D Insertion', A.ID_BASELINES)]
+METHOD_COLORS = {'Global': A.PARADIGM_PALETTE['Global Continuous AUC'],
+                 'I/D Deletion': A.PARADIGM_PALETTE['Standard I/D AUC (Deletion)'],
+                 'I/D Insertion': A.PARADIGM_PALETTE['Standard I/D AUC (Insertion)']}
+
+def plot_all_methods(da, measure, title, path):
+    """Rows = models, column groups = methods; candle per perturbation over the images
+    (PRISM IC/OC split IC | OC, the others a full candle)."""
+    models = list(dict.fromkeys(da['model']))
+    widths = [len(conds) for _, conds in METHOD_COLUMNS]
+    fig, axes = plt.subplots(len(models), len(METHOD_COLUMNS), figsize=(1.05 * sum(widths) + 3, 2.6 * len(models)),
+                             squeeze=False, gridspec_kw={'width_ratios': widths}, sharey='row')
+    for i, model in enumerate(models):
+        m_df = da[da['model'] == model]
+        for j, (method, conds) in enumerate(METHOD_COLUMNS):
+            ax = axes[i, j]
+            g = m_df[m_df['method'] == method]
+            for x, cond in enumerate(conds):
+                c = g[g['condition'] == cond]
+                if method == 'PRISM IC/OC':
+                    A.draw_half_violin(ax, x, c.loc[c['domain'] == 'IC', measure].dropna().values, -1, DOMAIN_COLORS['IC'])
+                    A.draw_half_violin(ax, x, c.loc[c['domain'] == 'OC', measure].dropna().values, +1, DOMAIN_COLORS['OC'])
+                else:
+                    v = c[measure].dropna().values
+                    A.draw_half_violin(ax, x, v, -1, METHOD_COLORS[method])
+                    A.draw_half_violin(ax, x, v, +1, METHOD_COLORS[method])
+            ax.set_xticks(range(len(conds)))
+            ax.set_xticklabels([A.perturbation_name(c) for c in conds] if i == len(models) - 1 else [],
+                               rotation=30, ha='right', fontsize=9)
+            ax.set_xlim(-0.6, len(conds) - 0.4)
+            if i == 0: ax.set_title(method, fontsize=12, fontweight='bold')
+            if j == 0: ax.set_ylabel(f"{model}\n({A.MODELS[model][2]})\n{measure}", fontsize=9)
+            ax.grid(True, color="#dddddd", lw=0.6)
+            ax.set_axisbelow(True)
+            for s in ("top", "right"): ax.spines[s].set_visible(False)
+    handles = [Patch(facecolor=DOMAIN_COLORS['IC'], alpha=0.55, label='PRISM IC curve'),
+               Patch(facecolor=DOMAIN_COLORS['OC'], alpha=0.55, label='PRISM OC curve')]
+    handles += [Patch(facecolor=c, alpha=0.55, label=m) for m, c in METHOD_COLORS.items()]
+    handles += [Line2D([], [], color="#222222", lw=1.4, label="median"),
+                Line2D([], [], color="#222222", lw=0.9, ls="--", label="quartiles")]
+    fig.suptitle(title, fontsize=17, fontweight='bold', y=1.0)
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False, bbox_to_anchor=(0.5, 0.985))
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, format='pdf', dpi=300, bbox_inches='tight')
+    fig.savefig(path[:-4] + ".png", dpi=110, bbox_inches='tight')
+    plt.close(fig)
 
 def extract_by_level():
     """Per step: model, image_id, noise, domain, noise level, rank_perplexity, instant_spillover_ratio."""
@@ -209,6 +315,13 @@ if __name__ == "__main__":
     for model in dict.fromkeys(s['model']):
         plot_model_by_level(model, s)
     plot_all_by_level(s)
+
+    da = extract_all_methods(df)
+    da.to_csv(os.path.join(OUT_DIR, "Penalties_All_Methods.csv"), index=False)
+    plot_all_methods(da, 'RP', "Rank perplexity per perturbation, all methods and models "
+                     "(mean over the perturbed steps; one value per image)", os.path.join(OUT_DIR, "Fig_All_Methods_RP.pdf"))
+    plot_all_methods(da, 'CSR', "CSR (conditional average spillover) per perturbation, all methods and models",
+                     os.path.join(OUT_DIR, "Fig_All_Methods_CSR.pdf"))
     pd.set_option('display.width', 200)
     print(df.groupby(['model', 'domain'], sort=False)[['RP', 'CSR']].median().unstack('domain').round(4).to_string())
     print(f"\n[DONE] Saved figures and CSVs to: {OUT_DIR}")
