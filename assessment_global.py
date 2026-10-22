@@ -38,6 +38,8 @@ OUT_DIR = f"{PRISM_ROOT}/Results/meta_evaluation"
 # Score families (paradigms) to evaluate
 PARADIGMS = {
     'S-Factor (IC/OC)': True,
+    'S-Factor (2)': True,          # IC utility punished by 1/(1-CSR) and 1/(1-RP_k); OC as in S-Factor (IC/OC)
+    'S-Factor new (2)': True,      # same utilities, aggregated as 100 * D_ic * I_oc
     'Global Continuous AUC': True,
     'Standard I/D AUC (Deletion)': True,
     'Standard I/D AUC (Insertion)': True,
@@ -65,11 +67,62 @@ PRINT_RANK_LISTS = False   # print the per-image rank matrix of every evaluation
 # ==========================================
 GAMMA = 1.0
 LAMBDA_P = 1.0
+ALPHA = 1.0     # rank-perplexity weight in the utility (as in prism.py)
+BETA = 1.0      # spillover weight in the utility (as in prism.py)
+
+def curve_utilities(levels):
+    """S-factor utility of every step, rebuilt from IoU (the stored discounted_utility is not used):
+        U_k = IoU_k * (1 - ALPHA*min(1, RP_k)) * max(0, 1 - BETA*spill_k)
+    RP_k = rank_perplexity and spill_k = instant_spillover_ratio of that same step (both 0 at the
+    clean step 0), i.e. prism.py's level-wise utility."""
+    return [float(l["global_iou"]) * (1.0 - ALPHA * min(1.0, float(l.get("rank_perplexity", 0.0))))
+            * max(0.0, 1.0 - BETA * float(l.get("instant_spillover_ratio", 0.0))) for l in levels]
+
+S2_MIN_DENOM = 0.0001     # S-Factor (2): floor of (1 - CSR) and (1 - RP_k), i.e. at most 100x per factor
+
+def curve_utilities_s2_ic(levels):
+    """S-Factor (2) utility of the IC curve: instability is punished by inflating the IC utility
+    (a higher retained IC value means a smaller gap, so a lower score):
+        U_0 = IoU_0                                                    (clean image)
+        U_k = IoU_k / max(S2_MIN_DENOM, 1 - CSR) / max(S2_MIN_DENOM, 1 - RP_k)   for k >= 1
+    CSR = conditional average spillover of this curve (mean instant_spillover_ratio over the steps
+    with spillover > 0, 0 if none; as prism.py), RP_k = rank_perplexity of step k."""
+    if not levels: return []
+    bleed = [float(l.get("instant_spillover_ratio", 0.0)) for l in levels[1:]]
+    bleed = [s for s in bleed if s > 0]
+    csr = sum(bleed) / len(bleed) if bleed else 0.0
+    out = [float(levels[0]["global_iou"])]
+    for l in levels[1:]:
+        rp = min(1.0, float(l.get("rank_perplexity", 0.0)))
+        out.append(float(l["global_iou"]) / max(S2_MIN_DENOM, 1.0 - csr) / max(S2_MIN_DENOM, 1.0 - rp))
+    return out
 
 def calculate_holistic_s_factor(ic_levels, oc_levels):
-    IC_vals = [float(lvl.get("discounted_utility", lvl.get("global_iou", 0.0))) for lvl in ic_levels]
-    OC_vals = [float(lvl.get("discounted_utility", lvl.get("global_iou", 0.0))) for lvl in oc_levels]
+    return s_factor_from_values(curve_utilities(ic_levels), curve_utilities(oc_levels))
 
+def calculate_s_factor_2(ic_levels, oc_levels):
+    """S-Factor (2): IC utility from curve_utilities_s2_ic, OC utility unchanged."""
+    return s_factor_from_values(curve_utilities_s2_ic(ic_levels), curve_utilities(oc_levels))
+
+def calculate_s_factor_new_2(ic_levels, oc_levels):
+    """S-Factor new (2): the S-Factor (2) utilities aggregated as 100 * D_ic * I_oc."""
+    return new_s_factor_from_values(curve_utilities_s2_ic(ic_levels), curve_utilities(oc_levels))
+
+def new_s_factor_from_values(IC_vals, OC_vals):
+    """Proposed aggregation, same weights as the S-factor (w_k = exp(-GAMMA*k/(N-1)), k >= 1):
+        D_ic = 1 - sum w_k*IC_k/IC_0 / sum w_k          drop of the IC prediction (rewarded)
+        I_oc = 1 - sum w_k*|OC_k/OC_0 - 1| / sum w_k    invariance to background noise
+        S    = 100 * clip(D_ic, 0, 1) * clip(I_oc, 0, 1)"""
+    I, O = np.asarray(IC_vals, float), np.asarray(OC_vals, float)
+    N = min(len(I), len(O))
+    if N < 2: return np.nan
+    w = np.exp(-GAMMA * np.arange(1, N) / (N - 1))
+    d_ic = 1 - np.sum(w * I[1:N] / max(1e-6, I[0])) / w.sum()
+    i_oc = 1 - np.sum(w * np.abs(O[1:N] / max(1e-6, O[0]) - 1)) / w.sum()
+    return 100 * float(np.clip(d_ic, 0, 1) * np.clip(i_oc, 0, 1))
+
+def s_factor_from_values(IC_vals, OC_vals):
+    """Original S-factor aggregation (discounted gap and drift) of per-step IC / OC values."""
     N_min = min(len(IC_vals), len(OC_vals))
     if N_min < 2: return np.nan
 
@@ -161,8 +214,11 @@ def extract_all_scores():
             records.append({'model': model, 'image_id': image_id, 'paradigm': paradigm,
                             'perturbation': perturbation, 'level': level, 'score': score})
 
-    # --- IC/OC S-FACTOR ---
-    if PARADIGMS['S-Factor (IC/OC)']:
+    # --- IC/OC S-FACTORS ---
+    s_scores = [(p, fn) for p, fn in (('S-Factor (IC/OC)', calculate_holistic_s_factor),
+                                      ('S-Factor (2)', calculate_s_factor_2),
+                                      ('S-Factor new (2)', calculate_s_factor_new_2)) if PARADIGMS.get(p)]
+    if s_scores:
         for model, root in ICOC_DIRS.items():
             for image_id, data in load_jsons(root, f"{RUN_SUBDIR}/*/*_analysis.json", skipped, f"{model} IC/OC"):
                 try:
@@ -178,8 +234,9 @@ def extract_all_scores():
                     ic_lvls, oc_lvls = ic[noise]['level_data'], oc[noise]['level_data']
                     n = min(len(ic_lvls), len(oc_lvls))
                     for frac, lvl_lbl in levels:
-                        add(model, image_id, 'S-Factor (IC/OC)', noise_lbl, lvl_lbl,
-                            calculate_holistic_s_factor(truncate_levels(ic_lvls[:n], frac), truncate_levels(oc_lvls[:n], frac)))
+                        ti, to = truncate_levels(ic_lvls[:n], frac), truncate_levels(oc_lvls[:n], frac)
+                        for paradigm, fn in s_scores:
+                            add(model, image_id, paradigm, noise_lbl, lvl_lbl, fn(ti, to))
 
     # --- GLOBAL CONTINUOUS AUC ---
     if PARADIGMS['Global Continuous AUC']:
@@ -298,7 +355,9 @@ PARADIGM_PALETTE = {
     'Standard I/D AUC (Deletion)': '#d62728',
     'Standard I/D AUC (Insertion)': '#ff7f0e',
     'Global Continuous AUC': '#2ca02c',
-    'S-Factor (IC/OC)': '#1f77b4'
+    'S-Factor (IC/OC)': '#1f77b4',
+    'S-Factor (2)': '#8c564b',
+    'S-Factor new (2)': '#e377c2',
 }
 
 def plot_model_scheme(model, scheme, s_df):

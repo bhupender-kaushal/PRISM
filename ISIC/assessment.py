@@ -59,10 +59,20 @@ PRINT_RANK_LISTS = False   # print the per-image rank matrix of every evaluation
 # ==========================================
 GAMMA = 1.0
 LAMBDA_P = 1.0
+ALPHA = 1.0     # rank-perplexity weight in the utility (as in prism.py)
+BETA = 1.0      # spillover weight in the utility (as in prism.py)
+
+def curve_utilities(levels):
+    """S-factor utility of every step, rebuilt from IoU (the stored discounted_utility is not used):
+        U_k = IoU_k * (1 - ALPHA*min(1, RP_k)) * max(0, 1 - BETA*spill_k)
+    RP_k = rank_perplexity and spill_k = instant_spillover_ratio of that same step (both 0 at the
+    clean step 0), i.e. prism.py's level-wise utility."""
+    return [float(l["global_iou"]) * (1.0 - ALPHA * min(1.0, float(l.get("rank_perplexity", 0.0))))
+            * max(0.0, 1.0 - BETA * float(l.get("instant_spillover_ratio", 0.0))) for l in levels]
 
 def calculate_holistic_s_factor(ic_levels, oc_levels):
-    IC_vals = [float(lvl.get("discounted_utility", lvl.get("global_iou", 0.0))) for lvl in ic_levels]
-    OC_vals = [float(lvl.get("discounted_utility", lvl.get("global_iou", 0.0))) for lvl in oc_levels]
+    IC_vals = curve_utilities(ic_levels)
+    OC_vals = curve_utilities(oc_levels)
 
     N_min = min(len(IC_vals), len(OC_vals))
     if N_min < 2: return np.nan
