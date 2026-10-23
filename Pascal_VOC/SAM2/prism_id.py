@@ -6,6 +6,7 @@ import random
 import math
 import sys
 import gc
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -20,8 +21,6 @@ from skimage.segmentation import slic, mark_boundaries
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
-
-from sklearn.metrics import auc
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -106,17 +105,64 @@ def perturb_superpixels_with_level(original_image_scaled_01, superpixels_segment
             
     return np.clip(perturbed_image, 0.0, 1.0)
 
-CANVAS_LEVEL = 5.0   # noise level of the I/D noise canvases (top of the PRISM grid)
-
-def generate_baseline_canvas(orig_image_01, baseline_type):
+def generate_baseline_canvas(orig_image_01, baseline_type, img_name):
+    """I/D canvas: 'black' (zeros), 'mean' (the image's per-channel mean colour) or 'random'
+    (uniform values in [0, 1] per pixel and channel, seeded per image so all models get the same canvas)."""
     if baseline_type == 'black':
         return np.zeros_like(orig_image_01)
     elif baseline_type == 'mean':
         mean_color = np.mean(orig_image_01, axis=(0, 1), keepdims=True)
         return np.ones_like(orig_image_01) * mean_color
-    else:
-        dummy_all_mask = np.ones(orig_image_01.shape[:2], dtype=int)
-        return perturb_superpixels_with_level(orig_image_01, dummy_all_mask, [1], baseline_type, noise_level=CANVAS_LEVEL)
+    elif baseline_type == 'random':
+        rng = np.random.default_rng(zlib.crc32(img_name.encode()))
+        return rng.uniform(0, 1, orig_image_01.shape).astype(orig_image_01.dtype)
+    raise ValueError(f"Unknown baseline '{baseline_type}'")
+
+# --- Raw step records (probability is used only to rank the IC superpixels) ---
+def ic_ranks(probs, segments, ic_sps):
+    """Rank IC superpixels by mean probability with integer ranks 1..N (rank 1 = most confident).
+    Probabilities are rounded to 3 decimals; ties go to the larger superpixel, then the smaller sp_id."""
+    means = np.array([probs[segments == sp].mean() for sp in ic_sps])
+    areas = np.array([np.sum(segments == sp) for sp in ic_sps])
+    order = np.lexsort((np.asarray(ic_sps), -areas, -np.round(means, 3)))
+    ranks = np.empty(len(ic_sps), dtype=int)
+    ranks[order] = np.arange(1, len(ic_sps) + 1)
+    return ranks, means
+
+def rank_perplexity(ranks_k, ranks_0):
+    """Normalised Spearman footrule: sum |r_k - r_0| / floor(N^2 / 2); 0 = unchanged ranking."""
+    n = len(ranks_0)
+    if n < 2:
+        return 0.0
+    return float(np.abs(np.asarray(ranks_k) - np.asarray(ranks_0)).sum() / (n * n // 2))
+
+def bg_iou(pred_mask, gt_mask):
+    """IoU (%) of the predicted background with the GT background."""
+    bg_gt, bg_pred = (gt_mask == 0), (pred_mask == 0)
+    union = np.sum(bg_gt | bg_pred)
+    return float(np.sum(bg_gt & bg_pred) / union * 100.0) if union > 0 else 100.0
+
+def clean_ranking_record(segments, ic_sps, clean_ranks, clean_means):
+    """Clean (step 0) ranking of the IC superpixels, stored once per image."""
+    return [{"sp_id": int(sp), "mean_prob": round(float(p), 3), "rank": int(r), "area": int(np.sum(segments == sp))}
+            for sp, p, r in zip(ic_sps, clean_means, clean_ranks)]
+
+def step_record(step_idx, pos_key, pos, ssim_score, pred_mask, probs, gt_mask, segments,
+                ic_sps, clean_ranks, clean_bg_iou):
+    """Raw quantities of one step; no metric is computed here.
+    csr = drop of the background IoU against the clean prediction (0 if it does not drop)."""
+    inter = np.sum((pred_mask == 1) & (gt_mask > 0))
+    union = np.sum((pred_mask == 1) | (gt_mask > 0))
+    ranks_k, means_k = ic_ranks(probs, segments, ic_sps)
+    return {
+        "step_idx": int(step_idx),
+        pos_key: round(float(pos), 4),
+        "ssim": round(float(ssim_score), 4),
+        "global_iou": round(float(inter / union * 100.0) if union > 0 else 100.0, 2),
+        "csr": round(max(0.0, clean_bg_iou - bg_iou(pred_mask, gt_mask)) / 100.0, 4),
+        "rank_perplexity": round(rank_perplexity(ranks_k, clean_ranks), 4),
+        "sp_probs": {str(int(sp)): round(float(p), 3) for sp, p in zip(ic_sps, means_k)},
+    }
 
 # --- NEW: Image Downsampling and Saving Helper ---
 def save_downsampled_image(arr, path, is_mask=False, size=(256, 256)):
@@ -241,133 +287,64 @@ def get_model_wrapper(model_name: str, args: argparse.Namespace, device: torch.d
 # --------------------------------------------------------------------------
 def run_dual_trajectory_analysis(
     domain_name, model_wrapper, batch, orig_image_01, gt_mask, segments_slic,
-    sps_to_perturb, sps_to_measure, initial_pred_mask, initial_probs, best_channel_index,
-    ic_sps_all, oc_sps_all, baselines, save_dir
+    ic_sps_all, clean_ranks, initial_pred_mask, initial_probs, best_channel_index,
+    baselines, img_name, save_dir
 ):
-    analysis_results = {
-        "rank_distribution": [],
-        "trajectories": {}
-    }
+    """Insertion/Deletion over the IC superpixels, one superpixel per step, in clean probability-rank
+    order (the allowed use of probability). Every step stores the raw record with fraction_perturbed."""
+    analysis_results = {"trajectories": {}}
     to_tensor = transforms.ToTensor()
-    
-    if len(sps_to_perturb) == 0 or len(sps_to_measure) == 0: return analysis_results
-    
-    max_id = int(np.max(segments_slic)) + 1
-    valid_sp_to_measure = [int(sp) for sp in sps_to_measure if int(sp) < max_id]
-    sp_areas = {int(sp_id): int(np.sum(segments_slic == sp_id)) for sp_id in np.unique(segments_slic)}
-    
+
+    if len(ic_sps_all) == 0: return analysis_results
+
     # --- PROPOSITION 4: Save Initial States and SP Map ---
     vis_dir_root = os.path.join(save_dir, "visuals")
     os.makedirs(vis_dir_root, exist_ok=True)
-    
+
     sp_map = mark_boundaries(orig_image_01, segments_slic)
     save_downsampled_image(sp_map, os.path.join(vis_dir_root, "superpixel_map.jpg"))
     save_downsampled_image(orig_image_01, os.path.join(vis_dir_root, "initial_deletion_start.jpg"))
-    
-    # 1. Base Ranking (Probabilities)
-    rank_data = []
-    for sp_id in sps_to_perturb:
-        mask = (segments_slic == sp_id)
-        area = sp_areas[int(sp_id)]
-        mean_p = float(np.mean(initial_probs[mask]))
-        
-        if sp_id in ic_sps_all: gt_domain = "IC"
-        elif sp_id in oc_sps_all: gt_domain = "OC"
-        else: gt_domain = "Mixed"
 
-        rank_data.append({
-            "sp_id": int(sp_id), 
-            "area": area, 
-            "mean_prob": mean_p, 
-            "gt_domain": gt_domain
-        })
-        
-    rank_data.sort(key=lambda x: (x['mean_prob'], x['area']), reverse=True)
-    for rank, item in enumerate(rank_data, 1):
-        item['prob_rank'] = rank
-    prob_ranked_ids = [item['sp_id'] for item in rank_data]
-        
-    # --- PROPOSITION 2: Save SP Ranks (Stored seamlessly in the JSON output) ---
-    analysis_results["rank_distribution"] = rank_data
-    ranking_methods = {'prob_ranked': prob_ranked_ids}
-    
+    # Deletion / insertion order: clean probability rank (ic_ranks); ties: larger area first, then sp_id
+    sp_areas = {int(sp): int(np.sum(segments_slic == sp)) for sp in ic_sps_all}
+    order = sorted(zip(clean_ranks, ic_sps_all), key=lambda t: (t[0], -sp_areas[int(t[1])], int(t[1])))
+    ranking_methods = {'prob_ranked': [int(sp) for _, sp in order]}
+
     # --- PROPOSITION 1: Strict One-by-One Iteration ---
-    N_perturb = len(sps_to_perturb)
-    k_values = list(range(1, N_perturb + 1))  # Replaced linspace with 1-by-1 stepping
-    
-    bg_gt = (gt_mask == 0)
+    N_perturb = len(ic_sps_all)
+    k_values = list(range(1, N_perturb + 1))
+    clean_bg_iou = bg_iou(initial_pred_mask, gt_mask)
 
-    def get_step_superpixels(current_pred_mask, current_probs):
-        intersect_mask = (current_pred_mask == 1) & (gt_mask > 0)
-        union_mask = (current_pred_mask == 1) | (gt_mask > 0)
-        
-        intersect_counts = np.bincount(segments_slic[intersect_mask].ravel(), minlength=max_id)
-        union_counts = np.bincount(segments_slic[union_mask].ravel(), minlength=max_id)
-        
-        step_sps = []
-        for sp_id in valid_sp_to_measure:
-            u_val = union_counts[sp_id]
-            i_val = intersect_counts[sp_id]
-            iou_val = (i_val / u_val * 100.0) if u_val > 0 else 100.0
-            mask = (segments_slic == sp_id)
-            mean_p = float(np.mean(current_probs[mask]))
-            
-            step_sps.append({
-                "sp_id": int(sp_id),
-                "iou": round(float(iou_val), 2),
-                "mean_prob": round(mean_p, 4),
-                "area": sp_areas[int(sp_id)]
-            })
-        return step_sps
+    def predict(img_01):
+        b = batch.copy()
+        b['image_tensor'] = to_tensor(img_01).unsqueeze(0).float()
+        masks, probs = model_wrapper.predict(b)
+        return masks[best_channel_index], probs[best_channel_index]
 
-    def create_entry(frac, global_iou, spill, mean_f_prob, step_sps): 
-        return {
-            "fraction_perturbed": frac, 
-            "global_iou": round(float(global_iou), 2), 
-            "spillover_ratio": round(float(spill), 4), 
-            "mean_foreground_prob": round(float(mean_f_prob), 4),
-            "superpixels": step_sps
-        }
-
-    def calculate_auc(traj):
-        if len(traj) < 2: return 0.0
-        x = [e['fraction_perturbed'] for e in traj]
-        y = [e['global_iou'] / 100.0 for e in traj]
-        return float(auc(x, y))
-
-    base_sps = get_step_superpixels(initial_pred_mask, initial_probs)
+    def record(step_idx, fraction, img_01, pred, probs):
+        ssim_score = structural_similarity(orig_image_01, img_01, data_range=1.0, channel_axis=-1)
+        return step_record(step_idx, "fraction_perturbed", fraction, ssim_score, pred, probs, gt_mask,
+                           segments_slic, ic_sps_all, clean_ranks, clean_bg_iou)
 
     for baseline in baselines:
         analysis_results["trajectories"][baseline] = {}
-        bg_canvas = generate_baseline_canvas(orig_image_01, baseline)
-        
+        bg_canvas = generate_baseline_canvas(orig_image_01, baseline, img_name)
+
         # Save Initial State for Insertion specific to this baseline
         save_downsampled_image(bg_canvas, os.path.join(vis_dir_root, f"initial_insertion_start_{baseline}.jpg"))
-        
-        base_intersect = np.sum((initial_pred_mask == 1) & (gt_mask > 0))
-        base_union = np.sum((initial_pred_mask == 1) | (gt_mask > 0))
-        base_global_iou = (base_intersect / base_union * 100.0) if base_union > 0 else 100.0
-        base_f_prob = float(np.mean(initial_probs[initial_pred_mask == 1])) if np.any(initial_pred_mask == 1) else 0.0
-
-        b_noise = batch.copy()
-        b_noise['image_tensor'] = to_tensor(bg_canvas).unsqueeze(0).float()
-        masks_n, probs_n = model_wrapper.predict(b_noise)
-        pred_n, prob_n = masks_n[best_channel_index], probs_n[best_channel_index]
-        
-        ins_intersect0 = np.sum((pred_n == 1) & (gt_mask > 0))
-        ins_union0 = np.sum((pred_n == 1) | (gt_mask > 0))
-        ins_base_iou = (ins_intersect0 / ins_union0 * 100.0) if ins_union0 > 0 else 100.0
-        ins_base_prob = float(np.mean(prob_n[pred_n == 1])) if np.any(pred_n == 1) else 0.0
-        ins_base_sps = get_step_superpixels(pred_n, prob_n)
+        pred_n, prob_n = predict(bg_canvas)
 
         for r_name, r_ids in ranking_methods.items():
-            traj = {"deletion": [], "insertion": []}
-            traj["deletion"].append(create_entry(0.0, base_global_iou, 0.0, base_f_prob, base_sps))
-            traj["insertion"].append(create_entry(0.0, ins_base_iou, 0.0, ins_base_prob, ins_base_sps))
-            
+            # Step 0: deletion starts from the clean image, insertion from the full canvas
+            traj = {
+                "deletion": [step_record(0, "fraction_perturbed", 0.0, 1.0, initial_pred_mask, initial_probs, gt_mask,
+                                         segments_slic, ic_sps_all, clean_ranks, clean_bg_iou)],
+                "insertion": [record(0, 0.0, bg_canvas, pred_n, prob_n)],
+            }
+
             baseline_vis_dir = os.path.join(vis_dir_root, baseline, r_name)
             os.makedirs(baseline_vis_dir, exist_ok=True)
-            
+
             pbar = tqdm(k_values, desc=f"   -> [{domain_name[:2].upper()}] {baseline.upper()} | {r_name}", leave=False)
             for k in pbar:
                 fraction = round(k / N_perturb, 4)
@@ -376,29 +353,13 @@ def run_dual_trajectory_analysis(
 
                 # Deletion Step
                 img_del = np.where(mask_3d, bg_canvas, orig_image_01)
-                b_del = batch.copy()
-                b_del['image_tensor'] = to_tensor(img_del).unsqueeze(0).float()
-                m_del, p_del = model_wrapper.predict(b_del)
-                pred_del, prob_del = m_del[best_channel_index], p_del[best_channel_index]
-                
-                iou_del = (np.sum((pred_del == 1) & (gt_mask > 0)) / max(1, np.sum((pred_del == 1) | (gt_mask > 0)))) * 100.0
-                spill_del = np.sum((pred_del == 1) & bg_gt) / max(1, np.sum(bg_gt))
-                prob_f_del = float(np.mean(prob_del[pred_del == 1])) if np.any(pred_del == 1) else 0.0
-                del_sps = get_step_superpixels(pred_del, prob_del)
-                traj["deletion"].append(create_entry(fraction, iou_del, spill_del, prob_f_del, del_sps))
+                pred_del, prob_del = predict(img_del)
+                traj["deletion"].append(record(k, fraction, img_del, pred_del, prob_del))
 
                 # Insertion Step
                 img_ins = np.where(mask_3d, orig_image_01, bg_canvas)
-                b_ins = batch.copy()
-                b_ins['image_tensor'] = to_tensor(img_ins).unsqueeze(0).float()
-                m_ins, p_ins = model_wrapper.predict(b_ins)
-                pred_ins, prob_ins = m_ins[best_channel_index], p_ins[best_channel_index]
-                
-                iou_ins = (np.sum((pred_ins == 1) & (gt_mask > 0)) / max(1, np.sum((pred_ins == 1) | (gt_mask > 0)))) * 100.0
-                spill_ins = np.sum((pred_ins == 1) & bg_gt) / max(1, np.sum(bg_gt))
-                prob_f_ins = float(np.mean(prob_ins[pred_ins == 1])) if np.any(pred_ins == 1) else 0.0
-                ins_sps = get_step_superpixels(pred_ins, prob_ins)
-                traj["insertion"].append(create_entry(fraction, iou_ins, spill_ins, prob_f_ins, ins_sps))
+                pred_ins, prob_ins = predict(img_ins)
+                traj["insertion"].append(record(k, fraction, img_ins, pred_ins, prob_ins))
 
                 # --- PROPOSITION 3: Save the perturbed inputs and predicted masks ---
                 step_vis_dir = os.path.join(baseline_vis_dir, f"step_{k:03d}")
@@ -413,8 +374,6 @@ def run_dual_trajectory_analysis(
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-            traj["auc_del"] = calculate_auc(traj["deletion"])
-            traj["auc_ins"] = calculate_auc(traj["insertion"])
             analysis_results["trajectories"][baseline][r_name] = traj
 
     return analysis_results
@@ -444,7 +403,7 @@ def main():
     model_wrapper = get_model_wrapper(args.model_name, args, device)
     val_loader = create_generic_dataloader(data_dir=os.path.join(args.data_dir, args.target_class), image_size=tuple(args.image_size))
    
-    baselines = ['black', 'mean', 'poisson', 'gaussian', 'speckle', 'salt_pepper', 'gaussian_blur', 'rician']
+    baselines = ['black', 'mean', 'random']
 
     logger.info(f"\n[PHASE 1] Strict Anatomical Qualifier Scan...")
     with open(args.txtfile, 'r') as f: frozen_image_names = set([line.strip() for line in f.readlines()])
@@ -473,34 +432,42 @@ def main():
             'best_idx': best_idx, 'ic_sps_all': ic_sps_all, 'oc_sps_all': oc_sps_all
         })
 
-    logger.info(f"\n[PHASE 2] Executing IC-Restricted Dual-Rank I/D Trajectories over 8 Baselines...")
-    
+    logger.info(f"\n[PHASE 2] Executing IC-Restricted Prob-Rank I/D Trajectories over {len(baselines)} Baselines...")
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     for q_data in tqdm(qualified_images):
-        current_dir = os.path.join(args.output_dir, q_data['img_name'].rsplit('.', 1)[0])
+        stem = q_data['img_name'].rsplit('.', 1)[0]
+        current_dir = os.path.join(args.output_dir, stem)
         os.makedirs(current_dir, exist_ok=True)
-        
+
+        # Clean ranking of the IC superpixels, computed once per image and used for every step
+        clean_ranks, clean_means = ic_ranks(q_data['clean_probs'], q_data['segments_slic'], q_data['ic_sps_all'])
+
         res_global = run_dual_trajectory_analysis(
-            domain_name='prob_guided', 
-            model_wrapper=model_wrapper, 
-            batch=q_data['batch'], 
-            orig_image_01=q_data['orig_image_01'], 
-            gt_mask=q_data['gt_mask'], 
-            segments_slic=q_data['segments_slic'], 
-            sps_to_perturb=q_data['ic_sps_all'], 
-            sps_to_measure=q_data['ic_sps_all'], 
-            initial_pred_mask=q_data['pred_mask'], 
-            initial_probs=q_data['clean_probs'], 
-            best_channel_index=q_data['best_idx'], 
-            ic_sps_all=q_data['ic_sps_all'], 
-            oc_sps_all=q_data['oc_sps_all'], 
+            domain_name='prob_guided',
+            model_wrapper=model_wrapper,
+            batch=q_data['batch'],
+            orig_image_01=q_data['orig_image_01'],
+            gt_mask=q_data['gt_mask'],
+            segments_slic=q_data['segments_slic'],
+            ic_sps_all=q_data['ic_sps_all'],
+            clean_ranks=clean_ranks,
+            initial_pred_mask=q_data['pred_mask'],
+            initial_probs=q_data['clean_probs'],
+            best_channel_index=q_data['best_idx'],
             baselines=baselines,
+            img_name=stem,
             save_dir=current_dir  # Passing the directory down for image saving
         )
 
-        with open(os.path.join(current_dir, f"{q_data['img_name'].rsplit('.', 1)[0]}_analysis.json"), 'w') as f: 
-            json.dump({"prob_guided_analysis": res_global}, f, indent=4, cls=NpEncoder)
+        result = {
+            "image_info": {"name": stem},
+            "clean_ranking": clean_ranking_record(q_data['segments_slic'], q_data['ic_sps_all'], clean_ranks, clean_means),
+            "prob_guided_analysis": res_global,
+        }
+        with open(os.path.join(current_dir, f"{stem}_analysis.json"), 'w') as f:
+            json.dump(result, f, indent=4, cls=NpEncoder)
 
 if __name__ == "__main__":
     main()

@@ -260,105 +260,73 @@ def visualize_segmentation_comparison(orig_image_01, gt_mask, pred_mask, all_sp_
     plt.close(fig)
 
 # --------------------------------------------------------------------------
-# --- 3. Core Step-Wise Robustness Analysis (Upgraded with Global & Micro IoU)
+# --- 3. Raw Step Records (probability is used only to rank the IC superpixels)
+# --------------------------------------------------------------------------
+def ic_ranks(probs, segments, ic_sps):
+    """Rank IC superpixels by mean probability with integer ranks 1..N (rank 1 = most confident).
+    Probabilities are rounded to 3 decimals; ties go to the larger superpixel, then the smaller sp_id."""
+    means = np.array([probs[segments == sp].mean() for sp in ic_sps])
+    areas = np.array([np.sum(segments == sp) for sp in ic_sps])
+    order = np.lexsort((np.asarray(ic_sps), -areas, -np.round(means, 3)))
+    ranks = np.empty(len(ic_sps), dtype=int)
+    ranks[order] = np.arange(1, len(ic_sps) + 1)
+    return ranks, means
+
+def rank_perplexity(ranks_k, ranks_0):
+    """Normalised Spearman footrule: sum |r_k - r_0| / floor(N^2 / 2); 0 = unchanged ranking."""
+    n = len(ranks_0)
+    if n < 2:
+        return 0.0
+    return float(np.abs(np.asarray(ranks_k) - np.asarray(ranks_0)).sum() / (n * n // 2))
+
+def bg_iou(pred_mask, gt_mask):
+    """IoU (%) of the predicted background with the GT background."""
+    bg_gt, bg_pred = (gt_mask == 0), (pred_mask == 0)
+    union = np.sum(bg_gt | bg_pred)
+    return float(np.sum(bg_gt & bg_pred) / union * 100.0) if union > 0 else 100.0
+
+def clean_ranking_record(segments, ic_sps, clean_ranks, clean_means):
+    """Clean (step 0) ranking of the IC superpixels, stored once per image."""
+    return [{"sp_id": int(sp), "mean_prob": round(float(p), 3), "rank": int(r), "area": int(np.sum(segments == sp))}
+            for sp, p, r in zip(ic_sps, clean_means, clean_ranks)]
+
+def step_record(step_idx, pos_key, pos, ssim_score, pred_mask, probs, gt_mask, segments,
+                ic_sps, clean_ranks, clean_bg_iou):
+    """Raw quantities of one step; no metric is computed here.
+    csr = drop of the background IoU against the clean prediction (0 if it does not drop)."""
+    inter = np.sum((pred_mask == 1) & (gt_mask > 0))
+    union = np.sum((pred_mask == 1) | (gt_mask > 0))
+    ranks_k, means_k = ic_ranks(probs, segments, ic_sps)
+    return {
+        "step_idx": int(step_idx),
+        pos_key: round(float(pos), 4),
+        "ssim": round(float(ssim_score), 4),
+        "global_iou": round(float(inter / union * 100.0) if union > 0 else 100.0, 2),
+        "csr": round(max(0.0, clean_bg_iou - bg_iou(pred_mask, gt_mask)) / 100.0, 4),
+        "rank_perplexity": round(rank_perplexity(ranks_k, clean_ranks), 4),
+        "sp_probs": {str(int(sp)): round(float(p), 3) for sp, p in zip(ic_sps, means_k)},
+    }
+
+# --------------------------------------------------------------------------
+# --- 4. Core Step-Wise Robustness Analysis (raw quantities per noise level)
 # --------------------------------------------------------------------------
 def run_ranking_analysis(
     analysis_type, args, device, model,
     orig_image_np_01, pred_mask, gt_mask, segments_slic,
-    superpixels_to_perturb, superpixels_to_measure,
-    noise_types, noise_char_map, current_image_output_dir,
-    initial_probs, ic_sps_all, oc_sps_all,
-    save_visuals=False, alpha=1.0, beta=1.0
+    superpixels_to_perturb, noise_types, current_image_output_dir,
+    initial_probs, ic_sps_all, clean_ranks, save_visuals=False
 ):
-    logger = logging.getLogger('base')
-    analysis_results = {
-        "rank_distribution": [],
-        "level_data_per_noise": {}
-    }
-    
-    max_id = int(segments_slic.max()) + 1 
-
-    # --- Precalculate Superpixel Areas ---
-    sp_areas = {int(sp_id): int(np.sum(segments_slic == sp_id)) for sp_id in superpixels_to_measure}
-
-    # --- BG-IoU SPILLOVER BASELINE CALCULATION ---
-    bg_gt = (gt_mask == 0)
-    bg_pred_init = (pred_mask == 0)
-    intersection_bg_base = np.sum(bg_gt & bg_pred_init)
-    union_bg_base = np.sum(bg_gt | bg_pred_init)
-    iou_bg_base = (intersection_bg_base / union_bg_base * 100.0) if union_bg_base > 0 else 100.0
-    
-    # --- Global IoU Baseline ---
-    base_intersect = np.sum((pred_mask == 1) & (gt_mask > 0))
-    base_union = np.sum((pred_mask == 1) | (gt_mask > 0))
-    base_global_iou = (base_intersect / base_union * 100.0) if base_union > 0 else 100.0
-
-    # --- Micro IoU Baseline Arrays ---
-    intersect_mask_0 = (pred_mask == 1) & (gt_mask > 0)
-    union_mask_0 = (pred_mask == 1) | (gt_mask > 0)
-    int_counts_0 = np.bincount(segments_slic[intersect_mask_0].ravel(), minlength=max_id)
-    uni_counts_0 = np.bincount(segments_slic[union_mask_0].ravel(), minlength=max_id)
-
-    # --- Step 0 Baseline Probability Ranking ---
-    initial_sp_data = []
-    for sp_id in superpixels_to_measure:
-        mask = (segments_slic == sp_id)
-        mean_p = float(np.mean(initial_probs[mask]))
-        
-        u_val = uni_counts_0[sp_id]
-        i_val = int_counts_0[sp_id]
-        sp_iou = (i_val / u_val * 100.0) if u_val > 0 else 100.0
-        
-        # Domain tagging for Objective 2 (Violins & Rank Densities)
-        if sp_id in ic_sps_all: gt_domain = "IC"
-        elif sp_id in oc_sps_all: gt_domain = "OC"
-        else: gt_domain = "Mixed"
-
-        initial_sp_data.append({
-            "sp_id": int(sp_id), 
-            "mean_prob": mean_p,
-            "iou": round(float(sp_iou), 2),
-            "area": sp_areas[sp_id],
-            "gt_domain": gt_domain
-        })
-    
-    # Sort firmly by Probability (Replaces IoU sorting)
-    sorted_initial_sp_data = sorted(initial_sp_data, key=lambda x: (x['mean_prob'], x['area']), reverse=True)
-    for rank, sp_data in enumerate(sorted_initial_sp_data, 1): 
-        sp_data['rank'] = rank
-        
-    initial_ranks_map = {item['sp_id']: item['rank'] for item in sorted_initial_sp_data}
-    analysis_results["rank_distribution"] = sorted_initial_sp_data
-
-    N_measured = len(superpixels_to_measure)
-    max_possible_jumps = math.floor((N_measured**2) / 2.0) if N_measured > 1 else 1.0
-
-    # Base utility relies on probability ranking baseline
-    base_raw_mean_prob = np.mean([sp['mean_prob'] for sp in sorted_initial_sp_data]) if sorted_initial_sp_data else 0.0
-    base_utility_e0 = base_global_iou          # utility is IoU-based; probability is only used to rank superpixels
+    analysis_results = {"level_data_per_noise": {}}
+    clean_bg_iou = bg_iou(pred_mask, gt_mask)
 
     for noise_type in noise_types:
         if save_visuals:
             noise_specific_dir = os.path.join(current_image_output_dir, f"{analysis_type}_{noise_type}")
             os.makedirs(noise_specific_dir, exist_ok=True)
 
-        # Step 0 Baseline Entry
-        level_0_entry = {
-            "step_idx": 0,
-            "noise_level": 0.0,
-            "ssim": 1.0,
-            "global_iou": round(float(base_global_iou), 2),
-            "mean_raw_prob": round(float(base_raw_mean_prob * 100.0), 2),
-            "rank_perplexity": 0.0,
-            "instant_spillover_ratio": 0.0,
-            "discounted_utility": round(float(base_utility_e0), 2),
-            "superpixels": sorted_initial_sp_data
-        }
-        level_data_list = [level_0_entry]
-        
-        cumulative_spillover_ratio = 0.0
-        conditional_bleed_count = 0
-        peak_rp = 0.0
+        # Step 0: clean image
+        level_data_list = [step_record(0, "noise_level", 0.0, 1.0, pred_mask, initial_probs, gt_mask,
+                                       segments_slic, ic_sps_all, clean_ranks, clean_bg_iou)]
 
         noise_levels_arr = np.round(np.arange(1, int(round(args.max_level / args.noise_step)) + 1) * args.noise_step, 4)
         pbar = tqdm(noise_levels_arr, desc=f"   -> [{analysis_type[:2].upper()}] {noise_type}", leave=False, position=1)
@@ -389,99 +357,19 @@ def run_ranking_analysis(
                 overlay_image = mark_boundaries(img_rgb, perturbed_pred_mask, color=(1, 0, 0), mode='thick')
                 Image.fromarray((overlay_image * 255).astype(np.uint8)).resize((256, 256), Image.BILINEAR).save(os.path.join(noise_specific_dir, f"level_{noise_level:.2f}_ssim_{ssim_score:.4f}_overlay.png"))
 
-            # --- Global IoU at Step k ---
-            intersect_k = np.sum((perturbed_pred_mask == 1) & (gt_mask > 0))
-            union_k = np.sum((perturbed_pred_mask == 1) | (gt_mask > 0))
-            global_iou_k = (intersect_k / union_k * 100.0) if union_k > 0 else 100.0
+            level_data_list.append(step_record(step_idx + 1, "noise_level", noise_level, ssim_score,
+                                               perturbed_pred_mask, perturbed_probs, gt_mask, segments_slic,
+                                               ic_sps_all, clean_ranks, clean_bg_iou))
 
-            # --- Instant Background Spillover Ratio ---
-            bg_pred_pert = (perturbed_pred_mask == 0)
-            intersection_bg_pert = np.sum(bg_gt & bg_pred_pert)
-            union_bg_pert = np.sum(bg_gt | bg_pred_pert)
-            iou_bg_pert = (intersection_bg_pert / union_bg_pert * 100.0) if union_bg_pert > 0 else 100.0
-            
-            delta_iou_bg = iou_bg_base - iou_bg_pert
-            if delta_iou_bg > 0:
-                spillover_ratio_k = delta_iou_bg / 100.0
-                cumulative_spillover_ratio += spillover_ratio_k
-                conditional_bleed_count += 1
-            else:
-                spillover_ratio_k = 0.0
-
-            # --- Micro IoU Vectors at Step k ---
-            intersect_mask_k = (perturbed_pred_mask == 1) & (gt_mask > 0)
-            union_mask_k = (perturbed_pred_mask == 1) | (gt_mask > 0)
-            int_counts_k = np.bincount(segments_slic[intersect_mask_k].ravel(), minlength=max_id)
-            uni_counts_k = np.bincount(segments_slic[union_mask_k].ravel(), minlength=max_id)
-
-            # --- Dynamic Step-Wise Probability & IoU Extraction ---
-            current_level_sp_data = []
-            for sp_id in superpixels_to_measure:
-                mask = (segments_slic == sp_id)
-                mean_p_k = float(np.mean(perturbed_probs[mask]))
-                
-                u_val = uni_counts_k[sp_id]
-                i_val = int_counts_k[sp_id]
-                sp_iou = (i_val / u_val * 100.0) if u_val > 0 else 100.0
-
-                current_level_sp_data.append({
-                    "sp_id": int(sp_id), 
-                    "mean_prob": mean_p_k,
-                    "iou": round(float(sp_iou), 2),
-                    "area": sp_areas[sp_id]
-                })
-
-            # SORT DYNAMICALLY BY PROBABILITY TO MEASURE RANK JUMPS
-            sorted_superpixels = sorted(current_level_sp_data, key=lambda x: (x['mean_prob'], x['area']), reverse=True)          
-            for rank, sp_data in enumerate(sorted_superpixels, 1): 
-                sp_data['rank'] = rank
-            
-            current_ranks_map = {data['sp_id']: data['rank'] for data in sorted_superpixels}
-
-            # --- Normalized Rank Perplexity at Step k ---
-            total_rank_jumps = sum(abs(current_ranks_map[sp_id] - initial_ranks_map[sp_id]) for sp_id in superpixels_to_measure)
-            norm_rp_k = total_rank_jumps / max_possible_jumps if max_possible_jumps > 0 else 0.0
-            peak_rp = max(peak_rp, norm_rp_k)
-
-            # --- Step-Wise Discounted Utility (E_k) ---
-            raw_prob_mean_k = np.mean([sp['mean_prob'] for sp in sorted_superpixels]) if sorted_superpixels else 0.0
-            e_k = global_iou_k * (1.0 - alpha * min(1.0, norm_rp_k)) * max(0.0, 1.0 - beta * spillover_ratio_k)
-
-            level_data_list.append({
-                "step_idx": step_idx + 1,
-                "noise_level": round(float(noise_level), 3),
-                "ssim": round(float(ssim_score), 4),
-                "global_iou": round(float(global_iou_k), 2),
-                "mean_raw_prob": round(float(raw_prob_mean_k * 100.0), 2),
-                "rank_perplexity": round(float(norm_rp_k), 4),
-                "instant_spillover_ratio": round(float(spillover_ratio_k), 4),
-                "discounted_utility": round(float(e_k), 2),
-                "superpixels": sorted_superpixels
-            })
-            
         # Aggressive memory cleanup to prevent VRAM fragmentation sluggishness
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        avg_spillover = (cumulative_spillover_ratio / conditional_bleed_count) if conditional_bleed_count > 0 else 0.0
-        terminal_ssim = level_data_list[-1]['ssim'] if level_data_list else 1.0
-        mean_discounted_utility = np.mean([entry['discounted_utility'] for entry in level_data_list])
-
-        analysis_results["level_data_per_noise"][noise_type] = {
-            "base_utility_e0": round(float(base_utility_e0), 2),
-            "mean_step_discounted_utility": round(float(mean_discounted_utility), 2),
-            "terminal_ssim": round(float(terminal_ssim), 4),
-            "max_rank_perplexity": round(float(peak_rp), 4),
-            "spillover_metrics": { 
-                "conditional_average_spillover": round(float(avg_spillover), 4),
-                "bleed_count": int(conditional_bleed_count)
-            },
-            "level_data": level_data_list
-        }
+        analysis_results["level_data_per_noise"][noise_type] = {"level_data": level_data_list}
     return analysis_results
 # --------------------------------------------------------------------------
-# --- 4. Main Two-Phase Pipeline
+# --- 5. Main Two-Phase Pipeline
 # --------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="PRISM IC/OC Continuous Noise Engine - TransFuse")
@@ -518,8 +406,6 @@ def main():
     gt_root = os.path.join(args.dataroot_val, 'masks/')
     test_dataset = PngDataset(image_root, gt_root, args.testsize)
     test_loader = data.DataLoader(dataset=test_dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
-
-    noise_char_map = {noise: f'{noise}_strength' for noise in args.noise_types}
 
     # =========================================================================
     # PHASE 1: IMAGE QUALIFICATION SELECTION
@@ -605,19 +491,21 @@ def main():
 
             current_image_output_dir = os.path.join(run_output_dir, name.rsplit('.', 1)[0])
             os.makedirs(current_image_output_dir, exist_ok=True)
-            final_analysis = {"image_info": {"name": name.rsplit('.', 1)[0], "initial_dice_vs_gt": round(float(q_data['initial_dice_vs_gt']), 2)}}
+            # Clean ranking of the IC superpixels, computed once per image and used for every step
+            clean_ranks, clean_means = ic_ranks(initial_probs, segments_slic, ic_sps_all)
+            final_analysis = {"image_info": {"name": name.rsplit('.', 1)[0], "initial_dice_vs_gt": round(float(q_data['initial_dice_vs_gt']), 2)},
+                              "clean_ranking": clean_ranking_record(segments_slic, ic_sps_all, clean_ranks, clean_means)}
 
             # 1. In-Context Analysis
             res_ic = run_ranking_analysis(
-                'in_context', args, device, model_instance, orig_image_np_01, pred_mask, gt_mask_np, 
-                segments_slic, ic_sps_all, ic_sps_all, args.noise_types, noise_char_map, 
-                current_image_output_dir, initial_probs, ic_sps_all, oc_sps_all, save_visuals=(run_idx == 0)
+                'in_context', args, device, model_instance, orig_image_np_01, pred_mask, gt_mask_np,
+                segments_slic, ic_sps_all, args.noise_types,
+                current_image_output_dir, initial_probs, ic_sps_all, clean_ranks, save_visuals=(run_idx == 0)
             )
             final_analysis['in_context_analysis'] = res_ic
-            
-            # 2. Out-of-Context Analysis
-            num_oc_to_perturb = int(0.50 * len(oc_sps_all))
-            out_of_context_sp_to_perturb = random.sample(oc_sps_all, num_oc_to_perturb)
+
+            # 2. Out-of-Context Analysis (all OC superpixels perturbed)
+            out_of_context_sp_to_perturb = oc_sps_all
             
             if run_idx == 0:
                 in_context_map = np.zeros_like(segments_slic)
@@ -633,8 +521,8 @@ def main():
 
             res_oc = run_ranking_analysis(
                 'out_of_context', args, device, model_instance, orig_image_np_01, pred_mask, gt_mask_np, 
-                segments_slic, out_of_context_sp_to_perturb, ic_sps_all, args.noise_types, noise_char_map, 
-                current_image_output_dir, initial_probs, ic_sps_all, oc_sps_all, save_visuals=(run_idx == 0)
+                segments_slic, out_of_context_sp_to_perturb, args.noise_types,
+                current_image_output_dir, initial_probs, ic_sps_all, clean_ranks, save_visuals=(run_idx == 0)
             )
             final_analysis['out_of_context_analysis'] = res_oc
             
